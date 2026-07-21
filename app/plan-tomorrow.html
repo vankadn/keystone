@@ -18,7 +18,7 @@
   </style>
 </head>
 <body class="anon">
-  <nav><a href="./today.html">Today</a> | <a href="./plan-tomorrow.html">Plan Tomorrow</a> | <a href="./checkpoints.html">Checkpoints</a> | <a href="./report.html">Report</a></nav>
+  <nav><a href="../">Today</a> | <a href="./plan-tomorrow.html">Plan Tomorrow</a> | <a href="./checkpoints.html">Checkpoints</a> | <a href="./report.html">Report</a></nav>
   <h1>Plan Tomorrow</h1>
   <p id="status">Loading…</p>
   <button id="sign-in">Sign in</button>
@@ -189,7 +189,7 @@
       currentPerson = people.find((p) => p.personId === requestedPersonId) || people[0];
 
       if (!currentPerson) {
-        statusEl.textContent = 'No people found — add one from today.html first.';
+        statusEl.textContent = 'No people found — add one from the Today page first.';
         return;
       }
 

@@ -5,4 +5,8 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   base: '/keystone/', // match your actual repo name exactly
+  server: {
+    port: 3000, // matches the origin already allowlisted for local dev (see CLAUDE.md Config)
+    strictPort: true,
+  },
 })
