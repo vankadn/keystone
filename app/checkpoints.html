@@ -65,7 +65,7 @@
   <script type="module">
     import * as provider from '../shared/keystone-provider.js';
     import { isCheckpointReady, canGrantReward, resolveOpenRewardChoice } from '../shared/keystone-rules.js';
-    import { requestSilentToken, requestSignIn } from '../shared/keystone-auth.js';
+    import { requestSignIn } from '../shared/keystone-auth.js';
 
     const OAUTH_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 
@@ -292,18 +292,6 @@
       }
     });
 
-    async function tryAutoSignIn() {
-      try {
-        const token = await requestSilentToken(window.KEYSTONE_CONFIG.oauthClientId, OAUTH_SCOPE);
-        if (token) {
-          provider.setAccessToken(token);
-          setAuthedState(true);
-        }
-      } catch (err) {
-        console.warn('Silent sign-in failed, falling back to sign-in button.', err);
-      }
-    }
-
     signInBtn.addEventListener('click', async () => {
       signInBtn.disabled = true;
       clearWriteError();
@@ -351,8 +339,6 @@
       renderCheckpointRewardOptions();
       renderCheckpoints();
       renderRewardCatalog();
-
-      await tryAutoSignIn();
     }
 
     run().catch((err) => {

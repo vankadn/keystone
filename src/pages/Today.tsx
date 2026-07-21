@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import * as provider from '../lib/provider';
 import { isTaskStale, isCheckpointReady, isValidStatusTransition } from '../lib/rules';
-import { requestSilentToken, requestSignIn } from '../lib/auth';
+import { requestSignIn } from '../lib/auth';
 import type { Person, Habit, Task, HabitLogRow, Checkpoint } from '../lib/types';
 import { Button } from '@/components/ui/button';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
@@ -61,18 +61,6 @@ export default function Today() {
   const [busyHabitId, setBusyHabitId] = useState<string | null>(null);
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
 
-  async function trySilentSignIn() {
-    try {
-      const token = await requestSilentToken(window.KEYSTONE_CONFIG.oauthClientId, OAUTH_SCOPE);
-      if (token) {
-        provider.setAccessToken(token);
-        setIsAuthed(true);
-      }
-    } catch (err) {
-      console.warn('Silent sign-in failed, falling back to sign-in button.', err);
-    }
-  }
-
   useEffect(() => {
     async function run() {
       const params = new URLSearchParams(window.location.search);
@@ -85,7 +73,6 @@ export default function Today() {
 
       if (!person) {
         setStatus('No people yet — sign in to add the first person.');
-        await trySilentSignIn();
         return;
       }
 
@@ -101,8 +88,6 @@ export default function Today() {
       setHabitLog(habitLogResult);
       setCheckpoints(checkpointsResult);
       setStatus(`Showing ${today} for ${person.name}`);
-
-      await trySilentSignIn();
     }
 
     run().catch((err) => {
