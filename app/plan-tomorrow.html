@@ -1,0 +1,222 @@
+<!-- Phase 4 — Plan Tomorrow: review the recurring habits palette, see open
+     tasks (they persist automatically, no per-day copy needed), add a
+     one-off task, and close out the day — logging any habit with no
+     habit_log row yet as explicitly 'missed' so "not logged" and "logged
+     missed" stay distinguishable later. Entirely a write flow: OAuth
+     required for everything on this page, same silent-refresh-first
+     pattern as today.html. -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Keystone — Plan Tomorrow</title>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <style>
+    body.anon .write-control { display: none; }
+    body:not(.anon) #sign-in { display: none; }
+    #write-error { color: #b00020; }
+  </style>
+</head>
+<body class="anon">
+  <nav><a href="./today.html">Today</a> | <a href="./plan-tomorrow.html">Plan Tomorrow</a> | <a href="./checkpoints.html">Checkpoints</a> | <a href="./report.html">Report</a></nav>
+  <h1>Plan Tomorrow</h1>
+  <p id="status">Loading…</p>
+  <button id="sign-in">Sign in</button>
+  <p id="write-error"></p>
+
+  <section id="habits-palette" class="write-control">
+    <h2>Recurring habits</h2>
+    <p><em>Read-only preview of what's active — per-day habit toggling isn't built yet.</em></p>
+    <ul id="habits-list"></ul>
+  </section>
+
+  <section id="open-tasks" class="write-control">
+    <h2>Open tasks</h2>
+    <p><em>Carries forward automatically — nothing to do here unless it's stale.</em></p>
+    <ul id="tasks-list"></ul>
+  </section>
+
+  <section id="add-task" class="write-control">
+    <h2>Add a one-off task</h2>
+    <form id="add-task-form">
+      <input id="add-task-label" type="text" placeholder="Task" required />
+      <input id="add-task-due" type="date" />
+      <button type="submit">Add Task</button>
+    </form>
+  </section>
+
+  <section id="close-out" class="write-control">
+    <h2>Close out today</h2>
+    <p id="close-out-status"></p>
+    <button id="close-out-btn">Log missed habits for today</button>
+  </section>
+
+  <script src="./config.local.js"></script>
+  <script type="module">
+    import * as provider from '../shared/keystone-provider.js';
+    import { isTaskStale, getUnclosedHabits } from '../shared/keystone-rules.js';
+    import { requestSilentToken, requestSignIn } from '../shared/keystone-auth.js';
+
+    const OAUTH_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
+
+    const statusEl = document.getElementById('status');
+    const signInBtn = document.getElementById('sign-in');
+    const writeErrorEl = document.getElementById('write-error');
+    const habitsListEl = document.getElementById('habits-list');
+    const tasksListEl = document.getElementById('tasks-list');
+    const addTaskForm = document.getElementById('add-task-form');
+    const closeOutBtn = document.getElementById('close-out-btn');
+    const closeOutStatusEl = document.getElementById('close-out-status');
+
+    const today = todayISO();
+    let currentPerson = null;
+    let currentHabits = [];
+    let currentTasks = [];
+    let currentHabitLog = [];
+
+    function todayISO() {
+      return new Date().toISOString().slice(0, 10);
+    }
+
+    function setAuthedState(isAuthed) {
+      document.body.classList.toggle('anon', !isAuthed);
+    }
+
+    function showWriteError(message) {
+      writeErrorEl.textContent = message;
+    }
+
+    function clearWriteError() {
+      writeErrorEl.textContent = '';
+    }
+
+    function renderHabits() {
+      habitsListEl.innerHTML = '';
+      currentHabits.forEach((habit) => {
+        const li = document.createElement('li');
+        li.textContent = habit.label;
+        habitsListEl.appendChild(li);
+      });
+    }
+
+    function renderTasks() {
+      tasksListEl.innerHTML = '';
+      currentTasks.filter((task) => task.status === 'pending').forEach((task) => {
+        const stale = isTaskStale(task, today) ? ' [stale]' : '';
+        const li = document.createElement('li');
+        li.textContent = `${task.label}${task.dueDate ? ` (due ${task.dueDate})` : ''}${stale}`;
+        tasksListEl.appendChild(li);
+      });
+    }
+
+    function renderCloseOutStatus() {
+      const unclosed = getUnclosedHabits(currentHabits, currentHabitLog);
+      closeOutStatusEl.textContent = unclosed.length === 0
+        ? 'Every active habit is already logged for today.'
+        : `${unclosed.length} habit(s) not logged yet today: ${unclosed.map((h) => h.label).join(', ')}`;
+      closeOutBtn.disabled = unclosed.length === 0;
+    }
+
+    addTaskForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const label = document.getElementById('add-task-label').value.trim();
+      const dueDate = document.getElementById('add-task-due').value;
+      if (!label) return;
+
+      const submitBtn = addTaskForm.querySelector('button[type="submit"]');
+      submitBtn.disabled = true;
+      clearWriteError();
+      try {
+        const task = await provider.addTask(currentPerson.personId, label, dueDate);
+        currentTasks.push(task);
+        renderTasks();
+        addTaskForm.reset();
+      } catch (err) {
+        showWriteError(`Failed to add task: ${err.message}`);
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+
+    closeOutBtn.addEventListener('click', async () => {
+      closeOutBtn.disabled = true;
+      clearWriteError();
+      try {
+        const unclosed = getUnclosedHabits(currentHabits, currentHabitLog);
+        for (const habit of unclosed) {
+          const row = await provider.setHabitStatus(today, habit.habitId, 'missed');
+          currentHabitLog.push(row);
+        }
+        renderCloseOutStatus();
+      } catch (err) {
+        showWriteError(`Failed to close out day: ${err.message}`);
+      } finally {
+        closeOutBtn.disabled = false;
+      }
+    });
+
+    async function tryAutoSignIn() {
+      try {
+        const token = await requestSilentToken(window.KEYSTONE_CONFIG.oauthClientId, OAUTH_SCOPE);
+        if (token) {
+          provider.setAccessToken(token);
+          setAuthedState(true);
+        }
+      } catch (err) {
+        console.warn('Silent sign-in failed, falling back to sign-in button.', err);
+      }
+    }
+
+    signInBtn.addEventListener('click', async () => {
+      signInBtn.disabled = true;
+      clearWriteError();
+      try {
+        const token = await requestSignIn(window.KEYSTONE_CONFIG.oauthClientId, OAUTH_SCOPE);
+        provider.setAccessToken(token);
+        setAuthedState(true);
+      } catch (err) {
+        showWriteError(`Sign-in failed: ${err.message}`);
+      } finally {
+        signInBtn.disabled = false;
+      }
+    });
+
+    async function run() {
+      const params = new URLSearchParams(window.location.search);
+      const requestedPersonId = params.get('personId');
+
+      const people = await provider.getPeople();
+      currentPerson = people.find((p) => p.personId === requestedPersonId) || people[0];
+
+      if (!currentPerson) {
+        statusEl.textContent = 'No people found — add one from today.html first.';
+        return;
+      }
+
+      const [habits, tasks, habitLog] = await Promise.all([
+        provider.getHabits(currentPerson.personId),
+        provider.getTasks(currentPerson.personId),
+        provider.getHabitLog(currentPerson.personId, today),
+      ]);
+
+      currentHabits = habits;
+      currentTasks = tasks;
+      currentHabitLog = habitLog;
+
+      statusEl.textContent = `Planning for ${currentPerson.name}`;
+      document.querySelectorAll('nav a').forEach((a) => { a.href += `?personId=${currentPerson.personId}`; });
+
+      renderHabits();
+      renderTasks();
+      renderCloseOutStatus();
+
+      await tryAutoSignIn();
+    }
+
+    run().catch((err) => {
+      statusEl.textContent = `Failed to load: ${err.message}`;
+      console.error(err);
+    });
+  </script>
+</body>
+</html>

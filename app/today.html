@@ -15,6 +15,7 @@
   </style>
 </head>
 <body class="anon">
+  <nav><a href="./today.html">Today</a> | <a href="./plan-tomorrow.html">Plan Tomorrow</a> | <a href="./checkpoints.html">Checkpoints</a> | <a href="./report.html">Report</a></nav>
   <h1>Today</h1>
   <p id="status">Loading…</p>
   <button id="sign-in">Sign in</button>
@@ -236,6 +237,7 @@
       currentCheckpoints = checkpoints;
 
       statusEl.textContent = `Showing ${today} for ${currentPerson.name}`;
+      document.querySelectorAll('nav a').forEach((a) => { a.href += `?personId=${currentPerson.personId}`; });
 
       renderHabits();
       renderTasks();

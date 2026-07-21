@@ -3,17 +3,14 @@
 // what "complete" or "stale" means — that's keystone-rules.js).
 //
 // SHEET_SCHEMA below is the single source of truth for tab/column
-// structure — initializeSheet() reads from it, and ROADMAP.md's schema
-// doc mirrors it for readability rather than duplicating it as the
-// authority. Sheet structure is always app-initialized, never hand-edited.
+// structure — initializeSheet() reads from it. Sheet structure is always
+// app-initialized, never hand-edited.
 //
-// Reads are wired to the real Sheets API (anon, via API key). Writes that
-// need OAuth (initializeSheet, setHabitStatus, setTaskStatus) read the
-// token from a module-level variable set via setAccessToken() — this
-// keeps their own signatures unchanged from the Phase 1 mock contract;
-// sign-in/token-refresh orchestration lives in shared/keystone-auth.js
-// and app/*.html, never here. upsertCheckpoint/grantReward remain
-// mock/in-memory until Phase 4/5 add checkpoints + reward granting.
+// Reads are wired to the real Sheets API (anon, via API key). All OAuth
+// writes read their token from a module-level variable set via
+// setAccessToken() — this keeps their own signatures unchanged from the
+// Phase 1 mock contract; sign-in/token-refresh orchestration lives in
+// shared/keystone-auth.js and app/*.html, never here.
 
 export const SHEET_SCHEMA = {
   people: ['personId', 'name', 'theme', 'avatar'],
@@ -104,18 +101,6 @@ function columnLetter(oneIndexedPosition) {
   return String.fromCharCode(64 + oneIndexedPosition); // 1 -> A, 7 -> G, etc.
 }
 
-// ---- Mock data (backs upsertCheckpoint/grantReward only — Phase 4/5
-// scope; setHabitStatus/setTaskStatus are live as of Phase 3) ----
-
-const CHECKPOINTS = [
-  { date: '2026-07-16', personId: 'nyra', checkpointId: 'cp1', label: 'Weekend prep', itemIds: ['h1', 'h2', 't1'], rewardMode: 'fixed', rewardIds: ['r1'], status: 'ready' },
-  { date: '2026-07-16', personId: 'krishna', checkpointId: 'cp2', label: 'Fitness streak', itemIds: ['h3'], rewardMode: 'open', rewardIds: ['r2', 'r3'], status: 'pending' },
-];
-
-const REWARD_LOG = [
-  { date: '2026-07-10', personId: 'nyra', checkpointIdOrWeekId: 'cp0', rewardChosen: 'r1', grantedBy: 'krishna', status: 'granted' },
-];
-
 // ---------------------------------- Reads ----------------------------------
 
 export function getSheetId() {
@@ -181,7 +166,7 @@ export async function getRewardLog(personId) {
 // ---------------------------------- Writes ----------------------------------
 
 // habit_log is append-only — every status change is a new row, never an
-// edit of a past row (see ROADMAP.md Phase 1).
+// edit of a past row (see CLAUDE.md's Data model section).
 export async function setHabitStatus(dateISO, habitId, status) {
   const accessToken = requireAccessToken();
   const sheetId = await getSheetId();
@@ -235,12 +220,12 @@ function slugify(name) {
     .replace(/(^-|-$)/g, '');
 }
 
-// personId = slugified name + short suffix, so two people named the same
-// thing don't collide; not meant to be a durable public identifier scheme
-// beyond that.
-function generatePersonId(name) {
+// slugified seed + short random suffix, so two rows created from the same
+// text don't collide; not meant to be a durable public identifier scheme
+// beyond that. Shared by every client-generated id (person, task, ...).
+function generateId(prefix, seed) {
   const suffix = Math.random().toString(36).slice(2, 6);
-  return `${slugify(name) || 'person'}-${suffix}`;
+  return `${slugify(seed) || prefix}-${suffix}`;
 }
 
 // Minimal Add Person slice pulled forward from Phase 8 — name + theme only,
@@ -249,38 +234,168 @@ export async function addPerson(name, theme) {
   const accessToken = requireAccessToken();
   const sheetId = await getSheetId();
 
-  const row = { personId: generatePersonId(name), name, theme, avatar: '' };
+  const row = { personId: generateId('person', name), name, theme, avatar: '' };
   const values = SHEET_SCHEMA.people.map((col) => row[col] ?? '');
   await appendRow(sheetId, accessToken, 'people', values);
   return row;
 }
 
-export function upsertCheckpoint(checkpoint) {
-  const existing = CHECKPOINTS.find((cp) => cp.checkpointId === checkpoint.checkpointId);
-  if (existing) {
-    Object.assign(existing, checkpoint);
-    return Promise.resolve({ ...existing });
-  }
-  const created = { ...checkpoint };
-  CHECKPOINTS.push(created);
-  return Promise.resolve({ ...created });
+// One-off task add from Plan Tomorrow. dueDate is optional (''  if unset).
+export async function addTask(personId, label, dueDate) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const row = {
+    taskId: generateId('task', label),
+    personId,
+    label,
+    createdDate: todayISO(),
+    dueDate: dueDate || '',
+    status: 'pending',
+    lastCarriedDate: '',
+  };
+  const values = SHEET_SCHEMA.tasks.map((col) => row[col] ?? '');
+  await appendRow(sheetId, accessToken, 'tasks', values);
+  return row;
 }
 
-export function grantReward(checkpointIdOrWeekId, rewardChosen, grantedBy) {
-  const checkpoint = CHECKPOINTS.find((cp) => cp.checkpointId === checkpointIdOrWeekId);
+// Finds an existing row by idColumn === idValue and PUTs an update in
+// place; if not found, appends a new row. Shared by checkpoints and
+// reward_catalog, whose rows are edited after creation (unlike habit_log's
+// append-only history or people/tasks' single-purpose writers above).
+async function upsertRow(sheetId, accessToken, tabName, idColumn, idValue, rowObject) {
+  const rawRows = await fetchRawRows(tabName);
+  const header = rawRows[0] || SHEET_SCHEMA[tabName];
+  const idIndex = header.indexOf(idColumn);
+  const dataRowIndex = rawRows.slice(1).findIndex((row) => row[idIndex] === idValue);
+
+  const values = SHEET_SCHEMA[tabName].map((col) => rowObject[col] ?? '');
+  if (dataRowIndex === -1) {
+    await appendRow(sheetId, accessToken, tabName, values);
+  } else {
+    const sheetRowNumber = dataRowIndex + 2; // +1 header, +1 1-indexing
+    await updateRow(sheetId, accessToken, tabName, sheetRowNumber, values);
+  }
+  return rowObject;
+}
+
+// Deletes the row matching idColumn === idValue from tabName. Needs the
+// tab's numeric grid sheetId (distinct from the spreadsheet id), fetched
+// fresh each call — reward catalog deletes are rare, not worth caching.
+async function deleteRowById(sheetId, accessToken, tabName, idColumn, idValue) {
+  const rawRows = await fetchRawRows(tabName);
+  const header = rawRows[0] || SHEET_SCHEMA[tabName];
+  const idIndex = header.indexOf(idColumn);
+  const dataRowIndex = rawRows.slice(1).findIndex((row) => row[idIndex] === idValue);
+  if (dataRowIndex === -1) return false;
+
+  const meta = await sheetsApiRequest(`${sheetId}?fields=sheets.properties`, accessToken);
+  const tabProps = (meta.sheets || []).map((s) => s.properties).find((p) => p.title === tabName);
+  if (!tabProps) return false;
+
+  const sheetRowIndex = dataRowIndex + 1; // 0-indexed, +1 to skip header row
+  await batchUpdate(sheetId, accessToken, [{
+    deleteDimension: {
+      range: {
+        sheetId: tabProps.sheetId,
+        dimension: 'ROWS',
+        startIndex: sheetRowIndex,
+        endIndex: sheetRowIndex + 1,
+      },
+    },
+  }]);
+  return true;
+}
+
+// Checkpoints are planned once, then mutate in place (status -> 'granted')
+// — upsert semantics, same as tasks, unlike habit_log's append-only history.
+export async function upsertCheckpoint(checkpoint) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const checkpointId = checkpoint.checkpointId || generateId('checkpoint', checkpoint.label);
+  const row = {
+    ...checkpoint,
+    checkpointId,
+    itemIds: (checkpoint.itemIds || []).join(','),
+    rewardIds: (checkpoint.rewardIds || []).join(','),
+  };
+  await upsertRow(sheetId, accessToken, 'checkpoints', 'checkpointId', checkpointId, row);
+  return { ...checkpoint, checkpointId };
+}
+
+// ---- Reward catalog CRUD (per person) ----
+
+export async function addReward(personId, title, tags) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const row = { rewardId: generateId('reward', title), personId, title, tags: (tags || []).join(',') };
+  const values = SHEET_SCHEMA.reward_catalog.map((col) => row[col] ?? '');
+  await appendRow(sheetId, accessToken, 'reward_catalog', values);
+  return { ...row, tags: tags || [] };
+}
+
+export async function updateReward(rewardId, title, tags) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const rawRows = await fetchRawRows('reward_catalog');
+  const header = rawRows[0] || SHEET_SCHEMA.reward_catalog;
+  const existingRow = rawRows.slice(1).find((row) => row[header.indexOf('rewardId')] === rewardId);
+  if (!existingRow) throw new Error(`Unknown rewardId: ${rewardId}`);
+  const personId = existingRow[header.indexOf('personId')];
+
+  const row = { rewardId, personId, title, tags: (tags || []).join(',') };
+  await upsertRow(sheetId, accessToken, 'reward_catalog', 'rewardId', rewardId, row);
+  return { ...row, tags: tags || [] };
+}
+
+export async function deleteReward(rewardId) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+  return deleteRowById(sheetId, accessToken, 'reward_catalog', 'rewardId', rewardId);
+}
+
+// Parent-initiated, callable at any completion % — never automatic. Writes
+// an append-only reward_log row, then flips the matching checkpoint's
+// status to 'granted' (checkpoints mutate in place; reward_log does not).
+export async function grantReward(checkpointIdOrWeekId, rewardChosen, grantedBy) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const checkpointRows = await fetchSheetTab('checkpoints');
+  const checkpoint = checkpointRows.find((cp) => cp.checkpointId === checkpointIdOrWeekId);
+
   const row = {
     date: todayISO(),
-    personId: checkpoint ? checkpoint.personId : null,
+    personId: checkpoint ? checkpoint.personId : '',
     checkpointIdOrWeekId,
     rewardChosen,
     grantedBy,
     status: 'granted',
   };
-  REWARD_LOG.push(row);
+  const values = SHEET_SCHEMA.reward_log.map((col) => row[col] ?? '');
+  await appendRow(sheetId, accessToken, 'reward_log', values);
+
   if (checkpoint) {
-    checkpoint.status = 'granted';
+    await upsertRow(sheetId, accessToken, 'checkpoints', 'checkpointId', checkpoint.checkpointId, {
+      ...checkpoint,
+      itemIds: (checkpoint.itemIds || []).join(','),
+      rewardIds: (checkpoint.rewardIds || []).join(','),
+      status: 'granted',
+    });
   }
-  return Promise.resolve({ ...row });
+
+  return { ...row };
+}
+
+// Multi-day habit_log read for reports/weekly-rule evaluation — still just
+// filtering by the caller's requested range, not deciding what the range
+// should be (that judgment call stays in app/report.html).
+export async function getHabitLogRange(personId, fromDateISO, toDateISO) {
+  const rows = await fetchSheetTab('habit_log');
+  return rows.filter((row) => row.personId === personId && row.date >= fromDateISO && row.date <= toDateISO);
 }
 
 // ------------------------------ Setup (OAuth) ------------------------------
