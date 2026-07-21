@@ -73,8 +73,8 @@ gitignored, never commit it. Serve the repo as above, then:
 
 ## Status
 
-Early scaffolding — see [ROADMAP.md](./ROADMAP.md) for the phase breakdown
-and [CLAUDE.md](./CLAUDE.md) for architecture notes.
+Early scaffolding — see [CLAUDE.md](./CLAUDE.md) for architecture, status,
+and the phase roadmap.
 
 ## Live app
 
