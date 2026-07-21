@@ -2,7 +2,7 @@
 //
 // This layer knows the RULES (habit vs task lifecycle, checkpoint
 // completion logic) and nothing else. Pure functions only: no fetch, no
-// localStorage, no DOM, no imports from keystone-provider.js or app/*.
+// localStorage, no DOM, no imports from keystone-provider.js or src/pages/*.
 //
 // Dependency direction: UI -> provider, UI -> rules, provider -> rules.
 // Never rules -> provider, never rules -> UI. This file has zero imports.

@@ -10,7 +10,7 @@
 // writes read their token from a module-level variable set via
 // setAccessToken() — this keeps their own signatures unchanged from the
 // Phase 1 mock contract; sign-in/token-refresh orchestration lives in
-// shared/keystone-auth.js and app/*.html, never here.
+// keystone-auth.js and the src/pages/*.tsx components, never here.
 
 export const SHEET_SCHEMA = {
   people: ['personId', 'name', 'theme', 'avatar'],
@@ -26,8 +26,8 @@ export const SHEET_SCHEMA = {
 const SHEETS_API_BASE = 'https://sheets.googleapis.com/v4/spreadsheets';
 
 // Template Sheet for local dev/testing — already created, tabs not yet
-// initialized (run app/setup.html against it). Bring-your-own-sheet users
-// override via ?sheetId= or config.local.js's sheetId.
+// initialized (run the /setup route against it). Bring-your-own-sheet
+// users override via ?sheetId= or .env.local's VITE_SHEET_ID.
 const DEFAULT_SHEET_ID = '1kEWgsvtnpy4bVQDgBpdiplpuNGVRWNyty6ckMJvI8kk';
 const SHEET_ID_STORAGE_KEY = 'keystone.sheetId';
 
@@ -392,7 +392,7 @@ export async function grantReward(checkpointIdOrWeekId, rewardChosen, grantedBy)
 
 // Multi-day habit_log read for reports/weekly-rule evaluation — still just
 // filtering by the caller's requested range, not deciding what the range
-// should be (that judgment call stays in app/report.html).
+// should be (that judgment call stays in src/pages/Report.tsx).
 export async function getHabitLogRange(personId, fromDateISO, toDateISO) {
   const rows = await fetchSheetTab('habit_log');
   return rows.filter((row) => row.personId === personId && row.date >= fromDateISO && row.date <= toDateISO);

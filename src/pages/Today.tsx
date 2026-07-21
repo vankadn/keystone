@@ -9,6 +9,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Nav } from '../components/Nav';
 
 const OAUTH_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 
@@ -17,29 +18,6 @@ function todayISO() {
 }
 
 const today = todayISO();
-
-// Old app/*.html pages are still the live version of these until each gets
-// its own React port (deleted one at a time, not all at once) — see
-// CLAUDE.md. Once a page's React version lands, update every remaining
-// nav here (and in the old pages' own nav) to point at the new route.
-function Nav({ personId }: { personId: string | null }) {
-  const suffix = personId ? `?personId=${personId}` : '';
-  const links = [
-    { href: `/${suffix}`, label: 'Today' },
-    { href: `/app/plan-tomorrow.html${suffix}`, label: 'Plan Tomorrow' },
-    { href: `/app/checkpoints.html${suffix}`, label: 'Checkpoints' },
-    { href: `/app/report.html${suffix}`, label: 'Report' },
-  ];
-  return (
-    <nav className="flex gap-4 text-sm text-muted-foreground">
-      {links.map((link) => (
-        <a key={link.label} href={link.href} className="hover:text-foreground hover:underline">
-          {link.label}
-        </a>
-      ))}
-    </nav>
-  );
-}
 
 export default function Today() {
   const [status, setStatus] = useState('Loading…');

@@ -44,3 +44,25 @@ export interface Checkpoint {
   rewardIds: string[];
   status: string;
 }
+
+export interface Reward {
+  rewardId: string;
+  personId: string;
+  title: string;
+  tags: string[];
+}
+
+export interface WeeklyRule {
+  personId: string;
+  metric: string;
+  rewardId: string;
+}
+
+export interface RewardLogRow {
+  date: string;
+  personId: string;
+  checkpointIdOrWeekId: string;
+  rewardChosen: string;
+  grantedBy: string;
+  status: string;
+}
