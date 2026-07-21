@@ -3,6 +3,12 @@ import * as provider from '../lib/provider';
 import { isTaskStale, isCheckpointReady, isValidStatusTransition } from '../lib/rules';
 import { requestSilentToken, requestSignIn } from '../lib/auth';
 import type { Person, Habit, Task, HabitLogRow, Checkpoint } from '../lib/types';
+import { Button } from '@/components/ui/button';
+import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 
 const OAUTH_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 
@@ -18,12 +24,19 @@ const today = todayISO();
 // nav here (and in the old pages' own nav) to point at the new route.
 function Nav({ personId }: { personId: string | null }) {
   const suffix = personId ? `?personId=${personId}` : '';
+  const links = [
+    { href: `/${suffix}`, label: 'Today' },
+    { href: `/app/plan-tomorrow.html${suffix}`, label: 'Plan Tomorrow' },
+    { href: `/app/checkpoints.html${suffix}`, label: 'Checkpoints' },
+    { href: `/app/report.html${suffix}`, label: 'Report' },
+  ];
   return (
-    <nav>
-      <a href={`/${suffix}`}>Today</a> |{' '}
-      <a href={`/app/plan-tomorrow.html${suffix}`}>Plan Tomorrow</a> |{' '}
-      <a href={`/app/checkpoints.html${suffix}`}>Checkpoints</a> |{' '}
-      <a href={`/app/report.html${suffix}`}>Report</a>
+    <nav className="flex gap-4 text-sm text-muted-foreground">
+      {links.map((link) => (
+        <a key={link.label} href={link.href} className="hover:text-foreground hover:underline">
+          {link.label}
+        </a>
+      ))}
     </nav>
   );
 }
@@ -168,95 +181,133 @@ export default function Today() {
   }
 
   return (
-    <div>
+    <div className="mx-auto max-w-2xl space-y-6 p-6">
       <Nav personId={currentPerson?.personId ?? null} />
-      <h1>Today</h1>
-      <p>{status}</p>
-      {!isAuthed && (
-        <button onClick={handleSignIn} disabled={signInBusy}>
-          Sign in
-        </button>
-      )}
-      {writeError && <p style={{ color: '#b00020' }}>{writeError}</p>}
+
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-3xl font-semibold">Today</h1>
+          <p className="text-sm text-muted-foreground">{status}</p>
+        </div>
+        {!isAuthed && (
+          <Button onClick={handleSignIn} disabled={signInBusy}>
+            Sign in
+          </Button>
+        )}
+      </div>
+
+      {writeError && <p className="text-sm text-destructive">{writeError}</p>}
 
       {peopleChecked && !currentPerson && isAuthed && (
-        <section>
-          <h2>Add Person</h2>
-          <form onSubmit={handleAddPerson}>
-            <input
-              type="text"
-              placeholder="Name"
-              required
-              value={addPersonName}
-              onChange={(e) => setAddPersonName(e.target.value)}
-            />
-            <select value={addPersonTheme} onChange={(e) => setAddPersonTheme(e.target.value)}>
-              <option value="Playful">Playful</option>
-              <option value="Minimal">Minimal</option>
-              <option value="Warm">Warm</option>
-            </select>
-            <button type="submit" disabled={addPersonBusy}>
-              Add Person
-            </button>
-          </form>
-        </section>
+        <Card>
+          <CardHeader>
+            <CardTitle>Add Person</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={handleAddPerson} className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="add-person-name">Name</Label>
+                <Input
+                  id="add-person-name"
+                  required
+                  value={addPersonName}
+                  onChange={(e) => setAddPersonName(e.target.value)}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>Theme</Label>
+                <Select value={addPersonTheme} onValueChange={(value) => setAddPersonTheme(value as string)}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="Playful">Playful</SelectItem>
+                    <SelectItem value="Minimal">Minimal</SelectItem>
+                    <SelectItem value="Warm">Warm</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <Button type="submit" disabled={addPersonBusy}>
+                Add Person
+              </Button>
+            </form>
+          </CardContent>
+        </Card>
       )}
 
       {currentPerson && (
         <>
-          <section>
-            <h2>Habits</h2>
-            {habits.map((habit) => {
-              const logRow = habitLog.find((row) => row.habitId === habit.habitId);
-              const habitStatus = logRow ? logRow.status : null;
-              return (
-                <div key={habit.habitId}>
-                  {isAuthed ? (
-                    <input
-                      type="checkbox"
-                      checked={habitStatus === 'done'}
-                      disabled={busyHabitId === habit.habitId}
-                      onChange={(e) => handleHabitToggle(habit, e.target.checked, habitStatus)}
-                    />
-                  ) : null}
-                  {` ${habit.label} — ${habitStatus || 'not logged'}`}
-                </div>
-              );
-            })}
-          </section>
+          <Card>
+            <CardHeader>
+              <CardTitle>Habits</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              {habits.length === 0 && <p className="text-sm text-muted-foreground">No habits yet.</p>}
+              {habits.map((habit) => {
+                const logRow = habitLog.find((row) => row.habitId === habit.habitId);
+                const habitStatus = logRow ? logRow.status : null;
+                return (
+                  <div key={habit.habitId} className="flex items-center gap-2">
+                    {isAuthed && (
+                      <Checkbox
+                        checked={habitStatus === 'done'}
+                        disabled={busyHabitId === habit.habitId}
+                        onCheckedChange={(checked) => handleHabitToggle(habit, checked, habitStatus)}
+                      />
+                    )}
+                    <span className="text-sm">
+                      {habit.label} — {habitStatus || 'not logged'}
+                    </span>
+                  </div>
+                );
+              })}
+            </CardContent>
+          </Card>
 
-          <section>
-            <h2>Tasks</h2>
-            {tasks.map((task) => {
-              const stale = isTaskStale(task, today) ? ' [stale]' : '';
-              return (
-                <div key={task.taskId}>
-                  {isAuthed ? (
-                    <input
-                      type="checkbox"
-                      checked={task.status === 'done'}
-                      disabled={busyTaskId === task.taskId}
-                      onChange={(e) => handleTaskToggle(task, e.target.checked)}
-                    />
-                  ) : null}
-                  {` ${task.label} — ${task.status}${stale}`}
-                </div>
-              );
-            })}
-          </section>
+          <Card>
+            <CardHeader>
+              <CardTitle>Tasks</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              {tasks.length === 0 && <p className="text-sm text-muted-foreground">No tasks yet.</p>}
+              {tasks.map((task) => {
+                const stale = isTaskStale(task, today);
+                return (
+                  <div key={task.taskId} className="flex items-center gap-2">
+                    {isAuthed && (
+                      <Checkbox
+                        checked={task.status === 'done'}
+                        disabled={busyTaskId === task.taskId}
+                        onCheckedChange={(checked) => handleTaskToggle(task, checked)}
+                      />
+                    )}
+                    <span className="text-sm">
+                      {task.label} — {task.status}
+                      {stale && <span className="text-destructive"> [stale]</span>}
+                    </span>
+                  </div>
+                );
+              })}
+            </CardContent>
+          </Card>
 
-          <section>
-            <h2>Checkpoints</h2>
-            {checkpoints.map((checkpoint) => {
-              const ready = isCheckpointReady(checkpoint, habitLog, tasks) ? ' [ready to grant]' : '';
-              return (
-                <div key={checkpoint.checkpointId}>
-                  {checkpoint.label} — {checkpoint.status}
-                  {ready}
-                </div>
-              );
-            })}
-          </section>
+          <Card>
+            <CardHeader>
+              <CardTitle>Checkpoints</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              {checkpoints.length === 0 && <p className="text-sm text-muted-foreground">No checkpoints today.</p>}
+              {checkpoints.map((checkpoint) => {
+                const ready = isCheckpointReady(checkpoint, habitLog, tasks);
+                return (
+                  <p key={checkpoint.checkpointId} className="text-sm">
+                    {checkpoint.label} — {checkpoint.status}
+                    {ready && <span className="text-primary"> [ready to grant]</span>}
+                  </p>
+                );
+              })}
+            </CardContent>
+          </Card>
         </>
       )}
     </div>
