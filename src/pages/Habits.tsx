@@ -25,12 +25,16 @@ function HabitRow({
   habit: Habit;
   sections: DaySection[];
   busy: boolean;
-  onSave: (habitId: string, fields: { label: string; sectionId: string }) => void;
+  onSave: (habitId: string, fields: { label: string; sectionId: string; pointValue: number }) => void;
   onToggleActive: (habitId: string, active: boolean) => void;
 }) {
   const [label, setLabel] = useState(habit.label);
   const [sectionId, setSectionId] = useState(habit.sectionId);
-  const dirty = (label.trim().length > 0 && label.trim() !== habit.label) || sectionId !== habit.sectionId;
+  const [pointValue, setPointValue] = useState(String(habit.pointValue));
+  const dirty =
+    (label.trim().length > 0 && label.trim() !== habit.label) ||
+    sectionId !== habit.sectionId ||
+    Number(pointValue) !== habit.pointValue;
 
   return (
     <div className="flex flex-wrap items-center gap-2 border-b pb-2 last:border-b-0 last:pb-0">
@@ -52,12 +56,22 @@ function HabitRow({
           ))}
         </SelectContent>
       </Select>
+      <Input
+        type="number"
+        min="0"
+        value={pointValue}
+        disabled={busy}
+        onChange={(e) => setPointValue(e.target.value)}
+        className="w-16"
+        title="Points earned per completion"
+      />
+      <span className="text-xs text-muted-foreground">pts</span>
       {dirty && (
         <Button
           size="sm"
           variant="outline"
           disabled={busy || !label.trim()}
-          onClick={() => onSave(habit.habitId, { label: label.trim(), sectionId })}
+          onClick={() => onSave(habit.habitId, { label: label.trim(), sectionId, pointValue: Number(pointValue) || 1 })}
         >
           Save
         </Button>
@@ -82,6 +96,7 @@ export default function Habits() {
 
   const [newHabitLabel, setNewHabitLabel] = useState('');
   const [newHabitSectionId, setNewHabitSectionId] = useState('');
+  const [newHabitPointValue, setNewHabitPointValue] = useState('1');
   const [addHabitBusy, setAddHabitBusy] = useState(false);
 
   useEffect(() => {
@@ -145,7 +160,12 @@ export default function Habits() {
     setAddHabitBusy(true);
     setWriteError('');
     try {
-      const habit = (await provider.addHabit(currentPerson.personId, label, newHabitSectionId)) as Habit;
+      const habit = (await provider.addHabit(
+        currentPerson.personId,
+        label,
+        newHabitSectionId,
+        Number(newHabitPointValue) || 1
+      )) as Habit;
       setHabits((rows) => [...rows, habit]);
       setNewHabitLabel('');
     } catch (err) {
@@ -155,7 +175,7 @@ export default function Habits() {
     }
   }
 
-  async function handleSaveHabit(habitId: string, fields: { label: string; sectionId: string }) {
+  async function handleSaveHabit(habitId: string, fields: { label: string; sectionId: string; pointValue: number }) {
     setBusyHabitId(habitId);
     setWriteError('');
     try {
@@ -225,6 +245,15 @@ export default function Habits() {
                     ))}
                   </SelectContent>
                 </Select>
+                <Input
+                  type="number"
+                  min="0"
+                  value={newHabitPointValue}
+                  onChange={(e) => setNewHabitPointValue(e.target.value)}
+                  className="w-16"
+                  title="Points earned per completion"
+                />
+                <span className="text-xs text-muted-foreground">pts</span>
                 <Button type="submit" disabled={addHabitBusy || !newHabitSectionId}>
                   Add Habit
                 </Button>

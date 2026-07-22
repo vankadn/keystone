@@ -44,9 +44,13 @@ manual tab creation in Google Sheets — the app always owns the sheet
 structure.
 
 Then use the nav to get around: **Today** (`/`) for daily habit/task/
-class checkboxes, sectioned and drag-reorderable, plus checkpoints,
-**Plan Tomorrow** for arranging tomorrow's habits/tasks/classes and
-closing out the day, **Checkpoints** for grouping items into a
+class checkboxes, sectioned and drag-reorderable, plus checkpoints (a
+small "Adjust today's plan" link on Today jumps into the same arranging
+UI as Plan, just pointed at today instead of tomorrow), **Plan Tomorrow**
+(`/plan`) for arranging tomorrow's habits/tasks/classes and closing out
+the day — it's really a general "plan any date" view (`/plan?date=`),
+Nav's link just defaults to tomorrow — **Checkpoints** for grouping
+items into a
 reward-bearing checkpoint and granting rewards, **Report** for the week's
 habit completion/task aging/reward history (read-only, no sign-in
 needed), **Habits** and **Classes** for managing those definitions, and

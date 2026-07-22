@@ -52,11 +52,11 @@ via `initializeSheet()` (see Provider below), never hand-edited in Google
 Sheets.
 
 `habits.active` gates visibility, not existence — deactivating a habit
-(via `/habits`) hides it from Today/Plan Tomorrow without touching its
+(via `/habits`) hides it from Today/Plan without touching its
 `habit_log` history, since that history is append-only and a hard delete
 would orphan past rows' `habitId` reference. `habit_log.status` has three
 values now: `'done'`, `'missed'` (both existing), and `'skipped'` — set at
-*plan* time from Plan Tomorrow (not close-out time) when a habit
+*plan* time from `/plan` (not close-out time) when a habit
 legitimately doesn't apply to a given day. `'skipped'` is neutral in
 rolling-window math (weekly rules, Report's completion rate) — it's
 excluded from the window's effective day-count rather than counted as a
@@ -109,11 +109,52 @@ silent no-op — no `upsertDayPlanItem` call, item snaps back — while
 reordering within its own section persists normally. Other sections dim
 while dragging a habit as a visual cue that they're not valid targets.
 
+**Points system (Phase 12)** — flat per-item points, alongside (not
+replacing) the checkpoint/parent-granted reward model below. `habits`,
+`tasks`, and `classes` each gained a `pointValue` column (numeric,
+default 1). Three new tabs: `points_log` (append-only — `personId`,
+`date`, `itemType`, `itemId`, `pointsEarned`; one row per completion,
+snapshotting `pointValue` at that moment), `points_rewards` (`rewardId`,
+`name`, `pointCost` — **no `personId`**, deliberately a shared family
+catalog, unlike `reward_catalog` which is per-person), and
+`points_redemption_log` (append-only — `personId`, `rewardId`, `date`,
+`pointsSpent`). See Phase 12 in the Roadmap for the full ledger-vs-
+mutable-balance reasoning, the check/uncheck-reversal rule, and what's
+explicitly deferred (combo/compound weekly rules).
+
+**Milestone auto-rewards (Phase 13)** — a second, distinct reward
+mechanic layered on top of the points ledger. Two new tabs:
+`points_milestones` (`milestoneId`, `personId`, `pointInterval`,
+`rewardDescription` — per-person config, e.g. "every 100 points, comic
+book") and `milestone_grants_log` (append-only — `personId`,
+`milestoneId`, `date`, `pointsBalanceAtGrant`). **Auto-granted, no
+parent confirmation** — an explicit, intentional exception to the
+parent-granted convention checkpoints and points-catalog redemption both
+follow (see Reward model below); don't "fix" this into a grant-approval
+step later, it's deliberate. See Phase 13 in the Roadmap for the
+redeem-safety mechanics (why grants are based on cumulative earned
+points, never current balance).
+
 ## Reward model
 Checkpoints group items and carry a reward (fixed or open/pick-from-pool).
 Rewards are parent-GRANTED, never automatic — a checkpoint hitting 100%
 just surfaces "ready," a human decides when to grant it (including
-partial-completion judgment calls). `isCheckpointReady` (in
+partial-completion judgment calls). Points-catalog redemption (Phase 12)
+follows the same parent-facing spirit in practice, even though there's no
+literal "grant" step — a parent/kid taps Redeem together, it's still a
+human-initiated action, not something that fires on its own.
+
+**Milestone auto-rewards (Phase 13) are the one deliberate exception to
+"parent-granted."** They fire automatically the instant cumulative earned
+points cross the configured interval — no tap, no "ready, awaiting
+grant" state, no human in the loop at all. This is intentional, not an
+inconsistency to fix later: milestones are meant to feel like an
+automatic bonus/streak reward (think: a game's level-up), distinct in
+kind from checkpoints' and points-redemption's parent-mediated rewards.
+If you're reading this wondering why milestones don't go through a grant
+step like everything else here — that's why.
+
+`isCheckpointReady` (in
 `keystone-rules.js`) returns `false` once `checkpoint.status === 'granted'`,
 regardless of item completion — "ready to grant" is a call-to-action, not
 a completion readout, so it must stop showing once already granted (was a
@@ -142,7 +183,7 @@ see Data model — deliberately not hardcoded here since it grows with the
 schema) and deletes
 an empty leftover default tab (idempotent, safe to re-run); `setHabitStatus`
 appends to `habit_log` (append-only — past rows are never edited, now also
-used with status `'skipped'` from Plan Tomorrow at plan time, not just
+used with status `'skipped'` from `/plan` at plan time, not just
 `'done'`/`'missed'`); `setTaskStatus`/`addTask` mutate/append `tasks`
 rows; `addHabit(personId, label, sectionId)`/`updateHabit(habitId, {label,
 sectionId})`/`setHabitActive(habitId, active)` are `habits` CRUD
@@ -159,11 +200,17 @@ Phase 1 contract, same kind of documented exception as
 no avatar yet — full profile creation is Phase 8); `upsertCheckpoint` upserts a
 `checkpoints` row (auto-generates `checkpointId` if the caller omits
 one, same as `addPerson`/`addTask`); `addReward`/`updateReward`/
-`deleteReward` are basic CRUD against `reward_catalog`; `grantReward`
-appends a `reward_log` row and flips the matching checkpoint's status to
-`granted`; `getHabitLogRange(personId, from, to)` backs the report page's
-multi-day read (still just filtering by caller-given range, not deciding
-what the range should be — that judgment stays in `src/pages/Report.tsx`).
+`deleteReward` are basic CRUD against `reward_catalog` (managed from
+Checkpoints' "Reward catalog" card — this already existed, not new);
+`grantReward` appends a `reward_log` row and flips the matching
+checkpoint's status to `granted`; `getHabitLogRange(personId, from, to)`
+backs the report page's multi-day read (still just filtering by
+caller-given range, not deciding what the range should be — that
+judgment stays in `src/pages/Report.tsx`). `addWeeklyRule(personId,
+metric, rewardId)`/`updateWeeklyRule(ruleId, metric, rewardId)`/
+`deleteWeeklyRule(ruleId)` are `weekly_rules` CRUD, managed from
+`/report` — see Weekly rule metric grammar below for the string-building
+convention and the `ruleId` column this added.
 `addClass(personId, name, daysOfWeek, startTime, durationMinutes)`/
 `updateClass(classId, {name, daysOfWeek, startTime, durationMinutes})`/
 `setClassActive(classId, active)` are `classes` CRUD, same
@@ -191,6 +238,52 @@ model); `initializeSheet` additionally backfills default sections for any
 existing person who has none yet (idempotent — skips anyone who already
 has at least one `day_sections` row), catching people created before this
 feature existed.
+
+`awardPoints(personId, dateISO, itemType, itemId, pointsEarned)` appends
+to `points_log` (append-only) — called internally by `setHabitStatus`/
+`setTaskStatus`/`logClassStatus` whenever `pointsDeltaForTransition`
+(`keystone-rules.js`) computes a nonzero delta for that status change,
+never by UI code directly. This is the first (Phase 12) actual use of
+the provider -> rules dependency direction the architecture doc always
+allowed but this file never previously imported — `keystone-provider.js`
+now imports `pointsDeltaForTransition`/`computePointsBalance` from
+`./keystone-rules.js`, since "how many points is this transition worth"
+and "how is a balance derived" are decisions, not data-fetching, and
+belong there. `setHabitStatus` gained a 4th param, `previousStatus`
+(caller already has it, from the same local state `isValidStatusTransition`
+already checks — no extra fetch needed); `setTaskStatus` needed no
+signature change, since it already reads the existing row, hence the
+prior status, before overwriting it; `logClassStatus` needs neither —
+a class's status is one-way (no toggle-back once logged for a date), so
+points are only ever awarded there, never reversed.
+`addPointsReward`/`updatePointsReward`/`deletePointsReward` are
+`points_rewards` CRUD (shared catalog, no personId — see Data model);
+`getPointsBalance(personId)` fetches `points_log`+`points_redemption_log`
+(batched into one request, same mechanism as any other same-tick
+`Promise.all`) and derives the balance via `computePointsBalance` —
+never stores it. `redeemPointsReward(personId, rewardId, dateISO)`
+re-derives the balance and rejects (throws) if it's short of the
+reward's `pointCost`, before appending to `points_redemption_log`.
+
+`awardPoints` (above) now also runs `checkAndGrantMilestones` as a
+follow-up step after every points_log append — including reversal calls
+(negative `pointsEarned`), which is safe/harmless there since a
+reversal can only ever reduce how many levels are achievable, never
+cause a false grant. Cheap no-op for a person with zero configured
+milestones (only `points_milestones` gets read before bailing out).
+`addPointsMilestone`/`updatePointsMilestone`/`deletePointsMilestone`/
+`getPointsMilestones` are `points_milestones` CRUD, same pattern as
+elsewhere; `getMilestoneGrantsLog(personId)` is read-only — grant rows
+are only ever written by `checkAndGrantMilestones`, never directly by a
+caller. `calculateAchievementRate(logs, itemDefs, itemType, personId,
+periodStart, periodEnd)` (`keystone-rules.js`) is the Phase 13
+achievement-percentage function — pure, generalizes
+`computeHabitCompletionRate`/`evaluateClassAttendance` to an arbitrary
+date range and to Tasks; both of those older functions still exist
+(harmless, still exported) but `/report`'s UI now calls this newer one
+instead — see Phase 13 in the Roadmap for the per-item-type denominator
+rules and why Tasks needed a different convention (no per-day log to
+work from).
 All OAuth writes read their token from a module-level var set via
 `setAccessToken()` — token acquisition itself lives in
 `src/shared/keystone-auth.js`, never in the provider. Function signatures
@@ -209,7 +302,7 @@ that's the reason it was pulled, not an oversight.
 (key `keystone.accessToken`) on every successful sign-in — `sessionStorage`
 rather than `localStorage` deliberately, so a cached token never outlives
 the browser session/tab. That cache alone wasn't enough to keep pages
-signed in, though: each page (`Today`/`PlanTomorrow`/`Checkpoints`/`Setup`)
+signed in, though: each page (`Today`/`Plan`/`Checkpoints`/`Setup`)
 holds its own local `isAuthed` (or, for Setup, `accessToken`) React state,
 which used to start `false`/`null` on every mount with nothing reading the
 cache back — so react-router `<Link>` nav between pages (which Nav.tsx
@@ -225,15 +318,32 @@ other GIS flow.
 
 ## Weekly rule metric grammar
 `weekly_rules.metric` is a free-text Sheet cell with one supported
-grammar (parsed in `src/shared/keystone-rules.js`'s `evaluateWeeklyRule`):
-`"<habitId>:done>=<N>/<M>"`, e.g. `"h3:done>=5/7"` — habitId must have
->= N `'done'` `habit_log` rows within a **rolling** M-day window ending
-on the evaluation date (not calendar Mon–Sun, so evaluation never jumps
-discontinuously at a week boundary). Report habit-completion-rate math
-uses the same rolling-window convention. There's currently no UI to
-create `weekly_rules` rows — Phase 6 only builds evaluation, not CRUD —
-so a row has to be added by hand in the Sheet for now (not a "manual
-Sheet edit" of *structure*, just row data, same as any other content).
+grammar (parsed in `src/shared/keystone-rules.js`'s `evaluateWeeklyRule`,
+via `parseWeeklyMetric`): `"<habitId>:done>=<N>/<M>"`, e.g.
+`"h3:done>=5/7"` — habitId must have >= N `'done'` `habit_log` rows
+within a **rolling** M-day window ending on the evaluation date (not
+calendar Mon–Sun, so evaluation never jumps discontinuously at a week
+boundary). Report habit-completion-rate math uses the same
+rolling-window convention.
+
+`/report` now has full CRUD for `weekly_rules` (closes the gap this
+section used to flag — Phase 6 originally shipped evaluation only, no
+UI, rows had to be added by hand in the Sheet). The UI never lets the
+user type or edit the raw grammar string: `parseWeeklyMetric`/
+`buildWeeklyMetric` (both exported from `keystone-rules.js`) convert
+between the string and `{habitId, threshold, windowDays}`, so the add/
+edit form is a habit dropdown (that person's active habits) plus two
+number inputs — the string gets composed, never hand-typed, so it can't
+be malformed. N ≤ M is validated client-side before the Add/Save button
+enables (a rule requiring more done-days than the window has doesn't
+mean anything). `weekly_rules` gained a `ruleId` column (`addWeeklyRule`/
+`updateWeeklyRule`/`deleteWeeklyRule` in `keystone-provider.js`, same
+generate-id/re-fetch-existing-row CRUD pattern as everywhere else) since
+it previously had no dedicated identity column, which update/delete both
+need. `rewardId` on a rule is optional and just links to an existing
+`reward_catalog` entry for the parent's reference — nothing auto-grants
+it; granting still only ever happens through the Checkpoints grant flow
+(see Reward model above).
 
 `'skipped'` `habit_log` rows (see Data model above) are neutral in this
 math, in both `evaluateWeeklyRule` and `computeHabitCompletionRate`: they
@@ -293,7 +403,7 @@ are gone, deleted one at a time as each got a verified equivalent, not
 all at once.
 
 Verified live against the real template Sheet: 5 of the app's 7 routes
-(`/`, `/plan-tomorrow`, `/checkpoints`, `/report`, `/setup`) load and
+(`/`, `/plan`, `/checkpoints`, `/report`, `/setup`) load and
 correctly read real data with no console errors. Add Person (on `/`) is
 confirmed working end-to-end (write, then read back live via redirect).
 `initializeSheet` was verified live back in Phase 2 (same function,
@@ -301,13 +411,13 @@ now wired into `/setup`'s React version instead of the old inline
 script).
 
 Not yet personally clicked through in the current React UI: habit/task
-checkbox writes, Plan Tomorrow's add-task/close-out, Checkpoints' create/
+checkbox writes, Plan's add-task/close-out, Checkpoints' create/
 reward-CRUD, and Setup's Initialize Sheet button specifically —
 code-complete and type-checked, with real data loading correctly beneath
 them, but the write action itself hasn't been exercised end-to-end since
 the port. Don't treat these as fully done until they have been.
 
-The `/habits` route (create/rename/deactivate) and Plan Tomorrow's "Skip
+The `/habits` route (create/rename/deactivate) and Plan's "Skip
 tomorrow" action are brand new and entirely unverified live — code-
 complete, `tsc -b` clean, and the underlying logic (provider CRUD
 round-trips, `evaluateWeeklyRule`/`computeHabitCompletionRate`'s
@@ -316,7 +426,7 @@ already-skipped habit) was checked with standalone mocked-`fetch`/pure-
 function scripts, not against the live Sheets API or by clicking through
 the actual UI (browser automation was unavailable this session). Treat
 as unverified until someone has: added a habit via `/habits` and seen it
-on Today/Plan Tomorrow the same day; skipped a habit in Plan Tomorrow and
+on Today/Plan the same day; skipped a habit in Plan and
 confirmed it's not actionable in tomorrow's Today and isn't double-logged
 `'missed'` at close-out; and confirmed a habit with skipped history isn't
 penalized in the Report/weekly-rule numbers, all against a real Sheet.
@@ -331,7 +441,7 @@ function way as the habits work above — not against the live Sheets API,
 and not clicked through in a real browser (browser automation stayed
 unavailable this session too). Treat as unverified until someone has:
 added a class via `/classes` with specific weekdays and confirmed it only
-appears on Today/Plan Tomorrow on those weekdays; confirmed Skip defaults
+appears on Today/Plan on those weekdays; confirmed Skip defaults
 to student with Skip (teacher) as a clearly one-extra-click alternative;
 confirmed Reschedule logs the new time without also logging the original
 slot as missed; and confirmed deactivating a class leaves `class_log`
@@ -364,8 +474,9 @@ Auth-persistence fix (sessionStorage rehydration on mount, see Provider
 above) touched `keystone-auth.js`'s previously-stable-since-Phase-1
 contract — it gained one new export, `getCachedToken()`; existing exports
 (`requestSignIn`, `requestSilentToken`, `clearCachedToken`) are unchanged.
-Verified live: sign in on Today, nav to Plan Tomorrow, hard refresh all
-stayed signed in with no popup.
+Verified live: sign in on Today, nav to Plan (then still named "Plan
+Tomorrow" — see Phase 14 for the later rename/generalization), hard
+refresh all stayed signed in with no popup.
 
 Read-request batching (see Provider above) verified with a standalone
 script mocking `fetch` — 4 concurrent `provider.getX()` calls collapsed
@@ -391,7 +502,7 @@ collision-detection machinery isn't practically unit-testable outside a
 real DOM, and browser automation was unavailable this entire session (not
 just this phase). Treat the drag mechanics specifically — not just the
 data layer — as unverified until someone has dragged an item between
-sections and within a section on both Today and Plan Tomorrow, reloaded,
+sections and within a section on both Today and Plan, reloaded,
 and confirmed the order stuck.
 
 Phase 11's habit-fixed-section amendment (see Data model above) is also
@@ -400,7 +511,9 @@ was verified two ways: a standalone script confirming a habit stays in
 its `sectionId`-declared home even when a (deliberately adversarial)
 `day_plan_items` row claims a different section, honoring only that row's
 `itemSortOrder`; and a second script reproducing exactly how
-Today.tsx/PlanTomorrow.tsx build their item list (catching a real bug in
+Today.tsx/PlanTomorrow.tsx (renamed `Plan.tsx` in Phase 14, see below —
+this note describes the bug as found at the time, under the old name)
+build their item list (catching a real bug in
 the process — the pages wrap habits as `{itemType, itemId, habit}` with
 no top-level `sectionId`, which `groupItemsBySections` reads directly, so
 the fixed-home rule would have silently no-opped for every habit on both
@@ -414,6 +527,92 @@ clicked through in a real browser.
 `npm run build` clean, not yet clicked through live, but low-risk: it's
 an additive `<Link>` plus rendering the existing `<Nav>` component on
 `Setup.tsx`, no logic changed.
+
+`weekly_rules` CRUD on `/report` (see Weekly rule metric grammar above)
+is code-complete, `tsc -b`/`npm run build` clean, and verified two ways:
+a script confirming `buildWeeklyMetric`/`parseWeeklyMetric` round-trip
+correctly and that the client-side N ≤ M check rejects an invalid pair;
+and a second script reproducing the actual page flow end-to-end —
+build a metric from form-shaped inputs, `addWeeklyRule`, reload via
+`getWeeklyRules`, evaluate the reloaded row with the real
+`evaluateWeeklyRule` and confirm the result matches what was entered.
+Not yet clicked through live in a browser, same caveat as everything
+else this session. While scoping this, confirmed `reward_catalog` CRUD
+already has a UI — Checkpoints' "Reward catalog" card (add/edit/delete)
+predates this session and was already wired end-to-end — so nothing new
+was needed there; the CLAUDE.md gap this closes was specifically about
+`weekly_rules`, not rewards.
+
+Phase 12 (Points system) is code-complete, `tsc -b`/`npm run build`
+clean. Before implementing, one real design gap in the original ask got
+resolved by asking: whether unchecking a habit/task after points were
+awarded should reverse them — resolved as yes (see Phase 12's "check/
+uncheck-reversal rule" in the Roadmap), since otherwise repeated
+toggling would farm points indefinitely with no other way to "undo" an
+append-only ledger entry. Verified with two mocked-`fetch` scripts: the
+pure functions (`pointsDeltaForTransition`, `computePointsBalance`)
+against hand-computed expected deltas/balances for every transition
+case; and a full provider-level integration script reproducing the
+actual sequence an app session would produce — check a habit (+points),
+uncheck it (exact reversal back to 0), recheck (+points again),
+complete a class (+points), skip a class (no points), attempt to redeem
+with insufficient balance (rejected, balance unchanged), earn enough and
+redeem successfully (balance decreases exactly by `pointCost`, a
+`points_redemption_log` row appears) — every assertion passed, including
+inspecting the raw `points_log` rows to confirm each one shows the
+`pointValue` that was actually in effect at that moment. What's
+unverified: the live UI — balance display on Today, the redeem button's
+enabled/disabled state, the `pointValue` inputs on `/habits`/`/classes`/
+Plan's add-task form — none of it has been clicked through in
+a real browser, same standing caveat as every other phase this session.
+
+Phase 13 (milestones + achievement report) is code-complete, `tsc -b`/
+`npm run build` clean. Milestone logic verified with a mocked-`fetch`
+integration script that runs the exact scenarios the phase was scoped
+to validate: two completions crossing one 100-point milestone (exactly 1
+grant, not per-completion); redeeming the full balance down to 0 then
+re-earning back up to the original balance (confirmed **no** re-grant —
+the specific bug the redeem-safety design exists to prevent); earning
+further to cross a second interval (exactly 1 more grant, 2 total). The
+achievement-rate function was verified directly against hand-computed
+expected values for each item type, including the habit-skip-neutral
+and class-teacher-skip-neutral denominator cases. Unverified: the actual
+UI — period selector recompute, milestone CRUD on Checkpoints, the
+"N milestones earned" count on Today — none of it clicked through live,
+Chrome automation still couldn't reach this project's dev server from
+this environment when last attempted (see the session's earlier
+diagnosis: the automated browser and this shell aren't on the same
+network namespace, external sites load fine, only localhost/127.0.0.1
+fails) — try again if the environment changes, but don't assume a retry
+alone will fix it.
+
+Phase 14 (Plan generalization) is code-complete, `tsc -b`/`npm run
+build` clean. Verified: the date-label logic (`targetDateLabel`/
+`addDaysISO`, including a month-rollover case) and the `?date=`
+validation regex, both via a standalone script since they're plain date
+arithmetic with no I/O — not against the actual React component (can't
+easily execute a `.tsx` component's logic outside a browser runtime).
+Grepped the whole diff for stray `plan-tomorrow`/`PlanTomorrow`
+references post-rename and fixed everything found outside of
+deliberately-historical narrative in this file. Unverified, same
+browser-access blocker as everything else: the actual page in a
+browser — Nav's "Plan Tomorrow" link still landing correctly on
+tomorrow by default, Today's new "Adjust today's plan" link correctly
+targeting today, drag/skip/close-out all behaving identically to before
+regardless of which date is loaded, and specifically the close-out-day
+card's visibility toggling correctly between the two cases.
+
+The date-picker addition (same phase) is also code-complete, `tsc -b`/
+`npm run build` clean — flagged by the user immediately after the first
+pass landed, since hand-editing a URL query param isn't a real UI.
+Unverified live, same blocker: whether picking a date in the `<input
+type="date">` or clicking Today/Tomorrow actually triggers the
+same-path re-render + `useEffect` refetch as designed, rather than some
+subtlety in how `useNavigate()` interacts with a component that's
+already mounted — this is exactly the code path the "component-level
+correctness note" above was written defensively for, but "written
+defensively for" and "confirmed correct against a real click" are
+different things.
 
 ## Roadmap
 - **Phase 0 — Manual setup.** Repo created, Pages enabled, Sheets API
@@ -435,13 +634,20 @@ an additive `<Link>` plus rendering the existing `<Nav>` component on
   be read) and a per-habit "Skip tomorrow" action in Plan Tomorrow
   (logs `'skipped'` for tomorrow's date at plan time; see Data model and
   Weekly rule metric grammar above for the new status and its rolling-
-  window treatment).
+  window treatment). Phase title kept as-is for history — the page itself
+  was later renamed/generalized to `Plan` (any date, not just tomorrow),
+  see Phase 14.
 - **Phase 5 — Checkpoints + reward catalog + grant flow.** Group habits/
   tasks into a checkpoint with a reward (fixed or open/pool); reward
   catalog CRUD; grant action available at any completion %. Code-complete.
 - **Phase 6 — Weekly rules + reports.** `evaluateWeeklyRule` (see grammar
   above); week report — habit completion %, task aging, reward history —
-  computed client-side, no new tabs/columns. Code-complete.
+  computed client-side, no new tabs/columns. Code-complete. Extended
+  post-hoc with full `weekly_rules` CRUD on `/report` (the phase
+  originally shipped evaluation only, rows had to be added by hand in
+  the Sheet — see Weekly rule metric grammar above for how the gap
+  closed and why it's safe: the grammar string is always composed from
+  a habit picker + two numbers, never hand-typed).
 - **Phase 7 — Bring-your-own-sheet + polish.** `?sheetId=` paste-URL flow
   with validation and friendly errors; publish the template Sheet link
   in-app; a final architecture pass on this file.
@@ -501,8 +707,8 @@ an additive `<Link>` plus rendering the existing `<Nav>` component on
   (defaults `skippedBy: 'student'`; "Skip (teacher)" is a second, clearly-
   secondary button, not a form field, to keep the common case one click)
   and Reschedule (inline date/time picker, only appears once clicked).
-  Plan Tomorrow shows tomorrow's expected classes with a Skip-only action
-  (mirrors the Habit "Skip tomorrow" precedent from Phase 4) —
+  Plan shows the target date's expected classes with a Skip-only action
+  (mirrors the Habit "Skip [date]" precedent from Phase 4) —
   deliberately no Done/Reschedule there, since marking a class done
   before it happens doesn't make sense and reschedule-a-day-ahead wasn't
   a stated need; both stay Today-only actions.
@@ -554,12 +760,187 @@ an additive `<Link>` plus rendering the existing `<Nav>` component on
   renumbering every sibling in the section — one `upsertDayPlanItem` write
   per drag, not one per item, deliberately, given Sheets API write quota
   is a real constraint (see the read-quota 429 story in Provider above).
-  Plan Tomorrow additionally gets a small inline section-management UI
+  Plan additionally gets a small inline section-management UI
   (add/rename/reorder/delete) at its top, rather than a separate settings
   page — that's the natural point of use. Classes remain draggable into
   sections for visual grouping even though their `startTime` is fixed and
   doesn't change — the person is planning around them as anchors, per the
   original ask.
+- **Phase 12 — Points system.** Flat per-item points, alongside — not
+  replacing — the checkpoint/parent-granted reward model (Phase 5).
+  Built before the calendar-view phase, same "land the foundation before
+  building on it" ordering as Phase 11's amendment. Code-complete,
+  unverified live (see Status).
+
+  **Why an append-only ledger, not a live calculation**: point values
+  are configurable per item (`pointValue` on `habits`/`tasks`/`classes`),
+  which means they'll change over time as values get tuned. If points
+  were computed on the fly (`pointValue × completions`, read at balance-
+  check time), editing an item's `pointValue` later would retroactively
+  change everyone's *historical* earned points — silently rewriting the
+  past. Instead, earning an item snapshots its `pointValue` *at that
+  moment* into `points_log` — the same append-only principle `habit_log`/
+  `class_log` already follow. **Do not "optimize" this into a stored,
+  mutable balance counter later** — a stored counter can drift out of
+  sync with its own ledger (a missed decrement, a race, a bug); deriving
+  the balance fresh from the full log on every read cannot. This was a
+  deliberate, explicit design decision, not an oversight to fix.
+
+  **The check/uncheck-reversal rule**: Habits and Tasks are two-way
+  (a checkbox, done ↔ missed/pending); Classes are one-way (Done/Skip/
+  Reschedule, no toggle-back once logged for a date). Without a rule for
+  what happens when a habit/task is unchecked after earning points,
+  repeated checking/unchecking would farm points indefinitely — there's
+  no other way to "undo" an append-only `points_log` entry. The resolved
+  rule (`pointsDeltaForTransition` in `keystone-rules.js`): entering
+  `'done'` earns the item's current `pointValue`; **leaving** `'done'`
+  appends a *negative* `points_log` entry for exactly that amount (a
+  reversal row, never an edit of the original — ledger stays append-
+  only); any other transition is a no-op. Net effect of check → uncheck →
+  recheck is exactly one item's worth of points, not three. Classes don't
+  need the reversal half of this rule at all, by construction (no
+  toggle-back), so `logClassStatus` only ever awards, never reverses.
+
+  **Combo/compound weekly rules are explicitly OUT OF SCOPE for this
+  phase** — e.g. "habit X done ≥5/7 AND class Y attended AND task Z done"
+  earning a bonus. This phase only does flat per-item earning and
+  redemption. Compound-rule evaluation is a follow-up phase once basic
+  points have been validated in daily use — don't build it prematurely;
+  see `keystone-rules.js`'s Phase 12 comment block for the same note
+  in-code, so it doesn't get built accidentally while touching nearby
+  code.
+
+  **Data model / provider / domain**: see Data model and Provider above.
+
+  **UI**: Today shows the balance as a small, non-intrusive line next to
+  the date/person status text (not a card — this is a supplementary
+  system, shouldn't visually compete with the main habit/task/class
+  list), refreshed after any action that might earn/reverse points.
+  Checkpoints gained a "Points" card (alongside, not replacing, its
+  existing "Reward catalog" card) for the points-rewards catalog CRUD, a
+  Redeem button per reward (disabled — not hidden — when balance is
+  short, with a tooltip saying how many more points are needed) and a
+  redemption history list. `/habits`, `/classes`, and Plan's
+  add-task form each gained a `pointValue` number input (default 1).
+- **Phase 13 — Milestone auto-rewards + achievement percentage report.**
+  Two unrelated mechanics bundled into one phase. Code-complete,
+  unverified live (see Status).
+
+  **A. Milestone auto-rewards** — a second, distinct reward mechanic on
+  top of the Phase 12 points ledger; see Reward model above for why it's
+  the one deliberate exception to "parent-granted." Fires the instant
+  cumulative *earned* points (not current balance) cross a configured
+  `pointInterval`. The redeem-safety mechanic: "how many levels have
+  already fired" is tracked by counting existing `milestone_grants_log`
+  rows for that milestone, never by re-deriving a level from
+  balance ÷ interval on the fly — the latter would let a redeem-then-
+  re-earn-to-the-same-balance cycle look like a fresh crossing and
+  falsely re-fire. Basing the crossing check on lifetime *earned* points
+  instead of *balance* is what makes spending safe: redemption only
+  touches `spent`/`balance`, never `earned`, so it can never cause a
+  milestone to un-cross. `computeMilestoneGrantsDue(totalEarned,
+  pointInterval, existingGrantCount)` is the pure decision
+  (`keystone-rules.js`); `checkAndGrantMilestones`
+  (`keystone-provider.js`) is the I/O wrapper, invoked automatically
+  inside `awardPoints`.
+
+  **B. Achievement percentage report** — generalizes the existing
+  rolling-window completion math to (a) an arbitrary period, not just a
+  fixed lookback, (b) percentage output per item, not pass/fail, (c) all
+  three item types (habits/tasks/classes), not just habits.
+  `calculateAchievementRate` (`keystone-rules.js`) takes an explicit
+  `[periodStart, periodEnd]` — same "caller computes the range, this
+  function doesn't decide it" convention as `getHabitLogRange` — and
+  returns one result per item, never a blended average (Report renders
+  "piano: 90%, English: 100%" individually). Denominator conventions:
+  Habits — days in range minus `'skipped'` days (same neutral treatment
+  as `computeHabitCompletionRate`). Classes — expected occurrences per
+  `daysOfWeek` in range, minus `skippedBy:'teacher'` rows (neutral,
+  same convention as `evaluateClassAttendance`); `skippedBy:'student'`
+  rows count against it, same as always. Tasks — no existing per-period
+  completion convention to match (a task's status is a single mutable
+  field, not a recurring daily log entry, so `habit_log`/`class_log`'s
+  rolling-window shape doesn't apply); "in range" means `createdDate`
+  falls in the period, rate is binary per task (done ÷ 1). `/report`'s
+  period selector (Week/Month/Year) uses the same rolling-day-count
+  convention as everywhere else in this codebase (not calendar month/
+  year boundaries) — 7/30/365 days ending today. `habit_log`/`class_log`
+  are fetched once for the widest period (365 days) up front; switching
+  the selector is a client-side recompute over already-loaded rows, not
+  a re-fetch — deliberate, given this project's read-quota history (see
+  Provider above). The old fixed-7-day "Habit completion" card and its
+  backing function (`computeHabitCompletionRate`) are superseded by this
+  but not deleted — still exported, still correct, just no longer
+  wired into any page; same for `evaluateClassAttendance`, which had
+  never been wired into a page at all before this. **Combo-checkpoint UI
+  (e.g. "90% piano AND 100% English") was explicitly left out this
+  pass** — the prompt scoping this phase called it optional/additive and
+  said to keep the per-item report as the core deliverable; needs its
+  own pass if picked up later, reusing `calculateAchievementRate`
+  per-item underneath.
+- **Phase 14 — Generalize Plan Tomorrow into date-parametrized Plan.**
+  No data-model change (route/UI generalization only). Code-complete,
+  unverified live (see Status).
+
+  **What changed**: `PlanTomorrow.tsx` renamed to `Plan.tsx`; route
+  changed from the fixed `/plan-tomorrow` to `/plan?date=YYYY-MM-DD`,
+  defaulting to tomorrow when no `date` is given (so the existing Nav
+  "Plan Tomorrow" link needed no change beyond its `to` path — it stays
+  a bare `/plan`, no date param, and keeps landing on tomorrow exactly
+  as before). Every date-dependent piece that used to hardcode `tomorrow`
+  (habit/class skip actions, `day_plan_items` reads/writes, expected-
+  classes lookup, section arrangement) now derives from the parsed
+  `?date=` param instead — audited and confirmed nothing else assumed
+  "always the next day." Text that used to hardcode "tomorrow" (page
+  title, "Skip tomorrow" buttons, card subtitles, the loaded-status
+  line) now derives from a small `targetDateLabel` helper that reads
+  "Today"/"Tomorrow" for those two specific dates and falls back to the
+  raw ISO date otherwise — so the page still literally says "Plan
+  Tomorrow" when viewing tomorrow (the default), unchanged from before,
+  but says "Plan Today" when viewing today, etc.
+
+  **Today.tsx is unchanged apart from one addition**: a new "Adjust
+  today's plan" link (next to the status line) to `/plan?date=<today>`,
+  giving arrange/reorder/section-assignment access for the current day
+  without altering Today's own checkbox-list UI or behavior at all —
+  that was an explicit constraint from the original ask, not just an
+  implementation choice.
+
+  **Close-out-day gating** — the one genuine judgment call in this
+  phase, resolved directly by the request rather than left ambiguous:
+  "Close out today" always closes out literal `today` (unchanged
+  behavior, never the date being planned), but is now only *shown* when
+  `targetDate !== today` — i.e. only while planning a future day.
+  Showing it while `targetDate === today` would mean showing "close out
+  the very day you're currently mid-way through arranging," which is
+  exactly the premature-finalization risk that generalizing this page to
+  same-day use (via "Adjust today's plan") introduced; hiding it in that
+  one case removes the risk without changing what the button does the
+  rest of the time.
+
+  **Component-level correctness note**: `targetDate` is read from
+  `window.location.search` on every render, not once at module scope
+  like the old fixed `tomorrow` constant — and the main data-loading
+  `useEffect` depends on `[targetDate]`, not `[]`. Originally added
+  because neither of Plan's entry points at the time (Nav's bare `/plan`
+  link, Today's `/plan?date=` link) actually triggered a same-path
+  different-query navigation — both come from a different route, so the
+  component always fully remounts — but it was implemented reactively
+  anyway to close that latent gap pre-emptively. That judgment call paid
+  off immediately: the date picker added right after this (below) is
+  exactly that same-path-different-query case, and works because this
+  was already in place.
+
+  **Date picker (added right after this phase's first pass, same phase
+  number)**: the original ask only specified the two named entry points
+  (Nav's fixed "tomorrow" link, Today's fixed "today" link) — there was
+  no way to reach any *other* date except by hand-editing the URL's
+  `?date=` param, which isn't a real UI. Added a `type="date"` input plus
+  "Today"/"Tomorrow" quick-select buttons to Plan's header; all three call
+  a `goToDate(dateISO)` helper that navigates to `/plan?date=...`
+  (preserving `?personId=` if present) via `useNavigate()` — a client-side,
+  same-path navigation, which is precisely the case the reactive
+  `useEffect` above was already built to handle correctly.
 
 **Out of scope for the entire roadmap**: public/verified OAuth (Testing
 mode + Test Users list only), notifications/reminders, a native/mobile
@@ -579,3 +960,11 @@ nothing in this section is "next up" the way roadmap phases are.
   full calendar/specific-time view" Phase 11 explicitly deferred, not
   something to bolt onto day_sections. Needs its own roadmap phase when
   scoped.
+- **Combo/compound weekly rules for bonus points**: e.g. "habit X done
+  ≥5/7 AND class Y attended AND task Z done this week" earning a bonus
+  on top of the flat per-item points Phase 12 built. Deliberately not
+  built as part of Phase 12 — that phase is flat per-item earning/
+  redemption only; compound-condition evaluation is real new domain
+  logic (a rule engine, essentially), not a small addition, and should
+  wait until flat points have been validated in daily use. Needs its own
+  roadmap phase when scoped — distinct from Phase 12, don't conflate.

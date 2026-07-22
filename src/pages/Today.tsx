@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import * as provider from '../lib/provider';
 import {
   isTaskStale,
@@ -19,6 +20,8 @@ import type {
   DaySection,
   DayPlanItem,
   PlanItemType,
+  PointsBalance,
+  MilestoneGrantRow,
 } from '../lib/types';
 import { Button } from '@/components/ui/button';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
@@ -148,6 +151,8 @@ export default function Today() {
   const [classLog, setClassLog] = useState<ClassLogRow[]>([]);
   const [sections, setSections] = useState<DaySection[]>([]);
   const [dayPlanItems, setDayPlanItems] = useState<DayPlanItem[]>([]);
+  const [pointsBalance, setPointsBalance] = useState<PointsBalance | null>(null);
+  const [milestoneGrants, setMilestoneGrants] = useState<MilestoneGrantRow[]>([]);
 
   const [addPersonName, setAddPersonName] = useState('');
   const [addPersonTheme, setAddPersonTheme] = useState('Playful');
@@ -189,6 +194,8 @@ export default function Today() {
         classLogResult,
         sectionsResult,
         dayPlanResult,
+        pointsBalanceResult,
+        milestoneGrantsResult,
       ] = (await Promise.all([
         provider.getHabits(person.personId),
         provider.getTasks(person.personId),
@@ -198,7 +205,20 @@ export default function Today() {
         provider.getClassLog(person.personId, today),
         provider.getDaySections(person.personId),
         provider.getDayPlan(person.personId, today),
-      ])) as [Habit[], Task[], HabitLogRow[], Checkpoint[], Class[], ClassLogRow[], DaySection[], DayPlanItem[]];
+        provider.getPointsBalance(person.personId),
+        provider.getMilestoneGrantsLog(person.personId),
+      ])) as [
+        Habit[],
+        Task[],
+        HabitLogRow[],
+        Checkpoint[],
+        Class[],
+        ClassLogRow[],
+        DaySection[],
+        DayPlanItem[],
+        PointsBalance,
+        MilestoneGrantRow[],
+      ];
 
       setHabits(habitsResult.filter((h) => h.active));
       setTasks(tasksResult);
@@ -208,6 +228,8 @@ export default function Today() {
       setClassLog(classLogResult);
       setSections(sectionsResult);
       setDayPlanItems(dayPlanResult);
+      setPointsBalance(pointsBalanceResult);
+      setMilestoneGrants(milestoneGrantsResult);
       setStatus(`Showing ${today} for ${person.name}`);
     }
 
@@ -251,6 +273,30 @@ export default function Today() {
     }
   }
 
+  // Called after any action that might have earned/reversed points
+  // (habit/task done<->not-done, class done) so the header balance stays
+  // current — points aren't part of the optimistic local-state updates
+  // those handlers already do, since the delta is decided server-side
+  // (see setHabitStatus/setTaskStatus/logClassStatus in
+  // keystone-provider.js), so re-fetching the derived balance is simplest.
+  async function refreshPointsBalance() {
+    if (!currentPerson) return;
+    try {
+      // A single completion can both earn points and cross a milestone
+      // (checkAndGrantMilestones runs inside awardPoints server-side) —
+      // refresh both together so the header stays consistent.
+      const [balanceResult, grantsResult] = await Promise.all([
+        provider.getPointsBalance(currentPerson.personId),
+        provider.getMilestoneGrantsLog(currentPerson.personId),
+      ]);
+      setPointsBalance(balanceResult as PointsBalance);
+      setMilestoneGrants(grantsResult as MilestoneGrantRow[]);
+    } catch {
+      // Non-critical — the balance display just stays stale until the
+      // next successful refresh; don't surface this as a writeError.
+    }
+  }
+
   async function handleHabitToggle(habit: Habit, checked: boolean, previousStatus: string | null) {
     const toStatus = checked ? 'done' : 'missed';
     if (!isValidStatusTransition('habit', previousStatus, toStatus)) return;
@@ -258,11 +304,12 @@ export default function Today() {
     setBusyHabitId(habit.habitId);
     setWriteError('');
     try {
-      await provider.setHabitStatus(today, habit.habitId, toStatus);
+      await provider.setHabitStatus(today, habit.habitId, toStatus, previousStatus);
       setHabitLog((rows) => [
         ...rows.filter((row) => row.habitId !== habit.habitId),
         { date: today, personId: currentPerson!.personId, habitId: habit.habitId, status: toStatus, checkpointId: '' },
       ]);
+      await refreshPointsBalance();
     } catch (err) {
       setWriteError(`Failed to save "${habit.label}": ${(err as Error).message}`);
     } finally {
@@ -279,6 +326,7 @@ export default function Today() {
     try {
       const updated = await provider.setTaskStatus(task.taskId, toStatus);
       setTasks((rows) => rows.map((t) => (t.taskId === task.taskId ? { ...t, ...updated } : t)));
+      await refreshPointsBalance();
     } catch (err) {
       setWriteError(`Failed to save "${task.label}": ${(err as Error).message}`);
     } finally {
@@ -292,6 +340,7 @@ export default function Today() {
     try {
       const row = (await provider.logClassStatus(klass.classId, currentPerson!.personId, today, 'done')) as ClassLogRow;
       setClassLog((rows) => [...rows.filter((r) => r.classId !== klass.classId), row]);
+      await refreshPointsBalance();
     } catch (err) {
       setWriteError(`Failed to log "${klass.name}": ${(err as Error).message}`);
     } finally {
@@ -428,7 +477,19 @@ export default function Today() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-semibold">Today</h1>
-          <p className="text-sm text-muted-foreground">{status}</p>
+          <p className="text-sm text-muted-foreground">
+            {status}
+            {pointsBalance && ` — ${pointsBalance.balance} pts`}
+            {milestoneGrants.length > 0 && ` · ${milestoneGrants.length} milestone${milestoneGrants.length === 1 ? '' : 's'} earned`}
+          </p>
+          {currentPerson && (
+            <Link
+              to={`/plan?date=${today}${currentPerson.personId ? `&personId=${currentPerson.personId}` : ''}`}
+              className="text-sm text-muted-foreground hover:text-foreground hover:underline"
+            >
+              Adjust today's plan
+            </Link>
+          )}
         </div>
         {!isAuthed && (
           <Button onClick={handleSignIn} disabled={signInBusy}>

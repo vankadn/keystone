@@ -70,11 +70,22 @@ export function resolveOpenRewardChoice(rewardCatalog, rewardIds) {
 // weekly_rules.metric grammar (documented in CLAUDE.md as the source of
 // truth): "<habitId>:done>=<N>/<M>" e.g. "h3:done>=5/7" — habitId must
 // log >= N 'done' rows within a rolling M-day window ending today.
-function parseWeeklyMetric(metric) {
+// Exported so the weekly-rules CRUD UI can parse an existing rule back
+// into {habitId, threshold, windowDays} for editing, instead of asking
+// the user to hand-edit the grammar string.
+export function parseWeeklyMetric(metric) {
   const match = /^(.+):done>=(\d+)\/(\d+)$/.exec(metric || '');
   if (!match) return null;
   const [, habitId, threshold, windowDays] = match;
   return { habitId, threshold: Number(threshold), windowDays: Number(windowDays) };
+}
+
+// Inverse of parseWeeklyMetric — the UI composes a rule from a habit
+// picker + two number inputs (N, M) and calls this rather than ever
+// constructing/editing the grammar string by hand, so it can't be
+// malformed.
+export function buildWeeklyMetric(habitId, threshold, windowDays) {
+  return `${habitId}:done>=${threshold}/${windowDays}`;
 }
 
 // Rolling window, not calendar Mon–Sun, so evaluation doesn't jump
@@ -237,4 +248,175 @@ export function groupItemsBySections(items, sections, dayPlanItems) {
   }
 
   return sortedSections.map((section) => ({ section, items: bySection.get(section.sectionId) || [] }));
+}
+
+// ---- Phase 12: Points system — flat per-item point earning +
+// redemption, alongside (not replacing) the checkpoint/parent-granted
+// reward model. points_log is an append-only ledger, same convention as
+// habit_log/class_log: a habit/task/class's pointValue is snapshotted
+// into points_log.pointsEarned at the moment it's earned, never looked
+// up again later. If pointValue is edited afterward, past points_log
+// rows are unaffected — only future completions use the new value. This
+// is deliberate, not an oversight: computing points on the fly from
+// current pointValue would let editing a habit's points retroactively
+// rewrite everyone's historical earned points.
+//
+// Combo/compound weekly rules (e.g. "habit X >=5/7 AND class Y attended
+// AND task Z done" earning bonus points) are explicitly OUT OF SCOPE for
+// this phase — flat per-item earning and redemption only. That's a
+// follow-up phase once basic points have been validated in daily use;
+// don't build compound rule evaluation here. ----
+
+// Only 'done' earns points; leaving 'done' (e.g. unchecking a habit/task
+// on Today after it was already marked done) reverses exactly what was
+// earned entering it — a negative points_log entry, not an edit of the
+// original row (ledger stays append-only). This closes an otherwise-real
+// exploit: without it, checking and unchecking the same item repeatedly
+// would farm points, since points_log has no other way to "undo" an
+// earlier entry. Classes don't need this half of the rule: their status
+// is one-way (Done/Skip/Reschedule, no toggle-back once logged for a
+// date), so 'leaving done' never happens for a class — callers should
+// simply not call this for classes, just award flat pointValue on 'done'.
+export function pointsDeltaForTransition(previousStatus, newStatus, pointValue) {
+  const enteringDone = newStatus === 'done' && previousStatus !== 'done';
+  const leavingDone = previousStatus === 'done' && newStatus !== 'done';
+  if (enteringDone) return pointValue;
+  if (leavingDone) return -pointValue;
+  return 0;
+}
+
+// Balance is always DERIVED from the ledger (sum earned minus sum
+// spent), never stored as a mutable field anywhere — same principle as
+// habit_log's append-only history. A stored/cached balance counter could
+// drift out of sync with its own ledger (a missed decrement, a race, a
+// bug); a derived sum cannot. Do not "optimize" this into a stored
+// counter later — recomputing from the full log on every read is the
+// point, not an inefficiency to fix.
+export function computePointsBalance(pointsLogRows, redemptionLogRows) {
+  const earned = pointsLogRows.reduce((sum, row) => sum + (Number(row.pointsEarned) || 0), 0);
+  const spent = redemptionLogRows.reduce((sum, row) => sum + (Number(row.pointsSpent) || 0), 0);
+  return { earned, spent, balance: earned - spent };
+}
+
+// ---- Phase 13: milestone auto-rewards + achievement percentage report.
+// Two unrelated mechanics bundled into one phase; see CLAUDE.md's Phase
+// 13 for the full writeup of why each is designed the way it is. ----
+
+// Milestones fire automatically, no parent confirmation — an explicit,
+// intentional exception to the parent-granted convention checkpoints and
+// points-catalog redemption both follow (see Reward model in CLAUDE.md).
+// Based on cumulative EARNED points (sum of every points_log row for the
+// person, including negative reversal entries from unchecking a habit/
+// task — those genuinely weren't earned after all), never on current
+// balance: balance can be spent down by redemption, and spending must
+// never cause a milestone to re-fire once it's already been granted.
+// "Already granted" is tracked by counting existing
+// milestone_grants_log rows for that specific milestone — not by
+// re-deriving a level from balance/interval each time, which is exactly
+// what would let a redeem-then-re-earn cycle falsely look like a new
+// crossing. Returns how many NEW grants are due right now (usually 0 or
+// 1, but can be >1 if a single award jumped across more than one
+// interval at once — e.g. a big pointValue, or several completions
+// awarded in quick succession).
+export function computeMilestoneGrantsDue(totalEarned, pointInterval, existingGrantCount) {
+  if (!(pointInterval > 0)) return 0;
+  const achievableLevels = Math.floor(totalEarned / pointInterval);
+  return Math.max(achievableLevels - existingGrantCount, 0);
+}
+
+function dayCountBetween(periodStartISO, periodEndISO) {
+  const start = new Date(`${periodStartISO}T00:00:00Z`);
+  const end = new Date(`${periodEndISO}T00:00:00Z`);
+  return Math.floor((end - start) / (1000 * 60 * 60 * 24)) + 1;
+}
+
+function datesInRangeMatchingDaysOfWeek(periodStartISO, periodEndISO, daysOfWeek) {
+  const dates = [];
+  const cursor = new Date(`${periodStartISO}T00:00:00Z`);
+  const end = new Date(`${periodEndISO}T00:00:00Z`);
+  while (cursor <= end) {
+    const dateISO = cursor.toISOString().slice(0, 10);
+    if (daysOfWeek.includes(DAYS_OF_WEEK[cursor.getUTCDay()])) dates.push(dateISO);
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return dates;
+}
+
+// Generalizes computeHabitCompletionRate/evaluateClassAttendance's
+// rolling-window math to an arbitrary [periodStart, periodEnd] range
+// (caller computes week/month/year boundaries — this function just takes
+// a range, same "don't decide what the range should be" convention as
+// getHabitLogRange) and extends it to Tasks, which had no per-period
+// completion convention on Report before. Returns one entry per item in
+// itemDefs — a per-item breakdown, not a single blended number, since
+// Report renders "piano: 90%, English: 100%" individually.
+//
+// - Habits: 'done' rows ÷ days in range, with 'skipped' days excluded
+//   from the denominator — same neutral treatment as
+//   computeHabitCompletionRate (a paused habit shouldn't read worse than
+//   a genuinely missed one).
+// - Classes: 'done' rows ÷ expected occurrences in range (per
+//   daysOfWeek), with skippedBy:'teacher' rows excluded from the
+//   denominator (neutral) but skippedBy:'student' rows counting against
+//   it — same convention as evaluateClassAttendance.
+// - Tasks: no per-day log exists (a task's status is a single mutable
+//   field, not a recurring daily entry), so "in range" means created
+//   within the period; rate is binary per task (done ÷ 1) — there's no
+//   existing Report convention for task completion rate to match here,
+//   habit_log/class_log's rolling-window shape doesn't apply to a
+//   one-shot item.
+export function calculateAchievementRate(logs, itemDefs, itemType, personId, periodStart, periodEnd) {
+  const items = itemDefs.filter((item) => item.personId === personId);
+
+  if (itemType === 'habit') {
+    const totalDays = dayCountBetween(periodStart, periodEnd);
+    return items.map((habit) => {
+      const relevant = logs.filter(
+        (row) => row.habitId === habit.habitId && row.date >= periodStart && row.date <= periodEnd
+      );
+      const completed = relevant.filter((row) => row.status === 'done').length;
+      const skippedCount = relevant.filter((row) => row.status === 'skipped').length;
+      const expected = Math.max(totalDays - skippedCount, 0);
+      return {
+        itemId: habit.habitId,
+        label: habit.label,
+        completed,
+        expected,
+        rate: expected > 0 ? completed / expected : 1,
+      };
+    });
+  }
+
+  if (itemType === 'class') {
+    return items.map((klass) => {
+      const expectedDates = datesInRangeMatchingDaysOfWeek(periodStart, periodEnd, klass.daysOfWeek);
+      const relevant = logs.filter((row) => row.classId === klass.classId && expectedDates.includes(row.date));
+      const completed = relevant.filter((row) => row.status === 'done').length;
+      const teacherSkipCount = relevant.filter(
+        (row) => row.status === 'skipped' && row.skippedBy === 'teacher'
+      ).length;
+      const expected = Math.max(expectedDates.length - teacherSkipCount, 0);
+      return {
+        itemId: klass.classId,
+        label: klass.name,
+        completed,
+        expected,
+        rate: expected > 0 ? completed / expected : 1,
+      };
+    });
+  }
+
+  if (itemType === 'task') {
+    return items
+      .filter((task) => task.createdDate >= periodStart && task.createdDate <= periodEnd)
+      .map((task) => ({
+        itemId: task.taskId,
+        label: task.label,
+        completed: task.status === 'done' ? 1 : 0,
+        expected: 1,
+        rate: task.status === 'done' ? 1 : 0,
+      }));
+  }
+
+  return [];
 }

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import * as provider from '../lib/provider';
 import { isTaskStale, getUnclosedHabits, getExpectedClassesForDate, groupItemsBySections } from '../lib/rules';
 import { requestSignIn, getCachedToken } from '../lib/auth';
@@ -20,6 +21,7 @@ import { Nav } from '../components/Nav';
 import { DayPlanBoard } from '../components/DayPlanBoard';
 
 const OAUTH_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
+const DATE_PARAM_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 function todayISO() {
   return new Date().toISOString().slice(0, 10);
@@ -31,10 +33,28 @@ function tomorrowISO() {
   return d.toISOString().slice(0, 10);
 }
 
-const today = todayISO();
-const tomorrow = tomorrowISO();
+function addDaysISO(dateISO: string, days: number) {
+  const d = new Date(`${dateISO}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
 
-type TomorrowPlanItemBase =
+const today = todayISO();
+
+// Generalized from the original "Plan Tomorrow" — this page now plans
+// *any* date (via ?date=YYYY-MM-DD), defaulting to tomorrow when no date
+// is given, so the existing Nav "Plan Tomorrow" link needs no change.
+// Today.tsx links here with today's own date via "Adjust today's plan"
+// for same-day arrangement, without altering Today's own checkbox UI at
+// all — see CLAUDE.md's Phase 14 for the full reasoning, including why
+// "Close out today" is gated off when the target date IS today.
+function targetDateLabel(dateISO: string) {
+  if (dateISO === today) return 'Today';
+  if (dateISO === addDaysISO(today, 1)) return 'Tomorrow';
+  return dateISO;
+}
+
+type PlanItemBase =
   // sectionId here is read directly by groupItemsBySections (habits'
   // fixed home section, see keystone-rules.js) — it's not just along for
   // the ride on `habit`, the grouping function looks at the top-level field.
@@ -42,10 +62,10 @@ type TomorrowPlanItemBase =
   | { itemType: 'task'; itemId: string; task: Task }
   | { itemType: 'class'; itemId: string; klass: Class };
 
-type TomorrowPlanItem = TomorrowPlanItemBase & { itemSortOrder: number };
+type PlanItem = PlanItemBase & { itemSortOrder: number };
 
 // Inline section rename/reorder/delete — small enough to live at the top
-// of Plan Tomorrow rather than a separate settings page, matching where
+// of Plan rather than a separate settings page, matching where
 // arrangement actually happens.
 function SectionRow({
   section,
@@ -158,7 +178,28 @@ function SectionManager({
   );
 }
 
-export default function PlanTomorrow() {
+export default function Plan() {
+  // Re-read on every render (not just once at module scope, unlike the
+  // old fixed `tomorrow` constant) so this stays correct across a
+  // same-path ?date= change — which is now the normal way of changing
+  // dates via the picker below, not just a latent edge case; see the
+  // data-loading effect's dependency array, which re-runs whenever this
+  // actually changes.
+  const navigate = useNavigate();
+  const params = new URLSearchParams(window.location.search);
+  const requestedDate = params.get('date');
+  const requestedPersonIdParam = params.get('personId');
+  const targetDate = requestedDate && DATE_PARAM_PATTERN.test(requestedDate) ? requestedDate : tomorrowISO();
+  const dateLabel = targetDateLabel(targetDate);
+  const isFutureDate = targetDate !== today;
+
+  function goToDate(dateISO: string) {
+    const next = new URLSearchParams();
+    next.set('date', dateISO);
+    if (requestedPersonIdParam) next.set('personId', requestedPersonIdParam);
+    navigate(`/plan?${next.toString()}`);
+  }
+
   const [status, setStatus] = useState('Loading…');
   const [writeError, setWriteError] = useState('');
   const [isAuthed, setIsAuthed] = useState(false);
@@ -168,14 +209,15 @@ export default function PlanTomorrow() {
   const [habits, setHabits] = useState<Habit[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [habitLog, setHabitLog] = useState<HabitLogRow[]>([]);
-  const [tomorrowLog, setTomorrowLog] = useState<HabitLogRow[]>([]);
-  const [expectedClassesTomorrow, setExpectedClassesTomorrow] = useState<Class[]>([]);
-  const [tomorrowClassLog, setTomorrowClassLog] = useState<ClassLogRow[]>([]);
+  const [targetDateLog, setTargetDateLog] = useState<HabitLogRow[]>([]);
+  const [expectedClassesForTargetDate, setExpectedClassesForTargetDate] = useState<Class[]>([]);
+  const [targetDateClassLog, setTargetDateClassLog] = useState<ClassLogRow[]>([]);
   const [sections, setSections] = useState<DaySection[]>([]);
-  const [tomorrowPlanItems, setTomorrowPlanItems] = useState<DayPlanItem[]>([]);
+  const [targetDatePlanItems, setTargetDatePlanItems] = useState<DayPlanItem[]>([]);
 
   const [taskLabel, setTaskLabel] = useState('');
   const [taskDue, setTaskDue] = useState('');
+  const [taskPointValue, setTaskPointValue] = useState('1');
   const [addTaskBusy, setAddTaskBusy] = useState(false);
   const [closeOutBusy, setCloseOutBusy] = useState(false);
   const [busySkipHabitId, setBusySkipHabitId] = useState<string | null>(null);
@@ -192,7 +234,6 @@ export default function PlanTomorrow() {
 
   useEffect(() => {
     async function run() {
-      const params = new URLSearchParams(window.location.search);
       const requestedPersonId = params.get('personId');
 
       const people = (await provider.getPeople()) as Person[];
@@ -208,20 +249,20 @@ export default function PlanTomorrow() {
         habitsResult,
         tasksResult,
         habitLogResult,
-        tomorrowLogResult,
+        targetDateLogResult,
         classesResult,
-        tomorrowClassLogResult,
+        targetDateClassLogResult,
         sectionsResult,
-        tomorrowPlanResult,
+        targetDatePlanResult,
       ] = (await Promise.all([
         provider.getHabits(person.personId),
         provider.getTasks(person.personId),
         provider.getHabitLog(person.personId, today),
-        provider.getHabitLog(person.personId, tomorrow),
+        provider.getHabitLog(person.personId, targetDate),
         provider.getClasses(person.personId),
-        provider.getClassLog(person.personId, tomorrow),
+        provider.getClassLog(person.personId, targetDate),
         provider.getDaySections(person.personId),
-        provider.getDayPlan(person.personId, tomorrow),
+        provider.getDayPlan(person.personId, targetDate),
       ])) as [
         Habit[],
         Task[],
@@ -236,20 +277,23 @@ export default function PlanTomorrow() {
       setHabits(habitsResult.filter((h) => h.active));
       setTasks(tasksResult);
       setHabitLog(habitLogResult);
-      setTomorrowLog(tomorrowLogResult);
-      setExpectedClassesTomorrow(getExpectedClassesForDate(classesResult, tomorrow) as Class[]);
-      setTomorrowClassLog(tomorrowClassLogResult);
+      setTargetDateLog(targetDateLogResult);
+      setExpectedClassesForTargetDate(getExpectedClassesForDate(classesResult, targetDate) as Class[]);
+      setTargetDateClassLog(targetDateClassLogResult);
       setSections(sectionsResult);
-      setTomorrowPlanItems(tomorrowPlanResult);
-      setStatus(`Planning for ${person.name}`);
+      setTargetDatePlanItems(targetDatePlanResult);
+      setStatus(`Planning ${dateLabel.toLowerCase()} for ${person.name}`);
     }
 
     run().catch((err) => {
       setStatus(`Failed to load: ${err.message}`);
       console.error(err);
     });
+    // Re-runs if targetDate changes without a full path change (e.g. a
+    // future in-app link from one ?date= to another on this same route) —
+    // not just on mount, unlike most other pages' effects.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [targetDate]);
 
   async function handleSignIn() {
     setSignInBusy(true);
@@ -265,16 +309,16 @@ export default function PlanTomorrow() {
     }
   }
 
-  // Plan-time skip: logs 'skipped' for tomorrow's date so the habit doesn't
-  // show as actionable in tomorrow's Today, and so close-out's
+  // Plan-time skip: logs 'skipped' for the target date so the habit
+  // doesn't show as actionable on that date's Today, and so close-out's
   // getUnclosedHabits (which is presence-based, see keystone-rules.js)
-  // never overwrites it with 'missed' once tomorrow becomes today.
+  // never overwrites it with 'missed' once that date becomes today.
   async function handleSkip(habit: Habit) {
     setBusySkipHabitId(habit.habitId);
     setWriteError('');
     try {
-      const row = (await provider.setHabitStatus(tomorrow, habit.habitId, 'skipped')) as HabitLogRow;
-      setTomorrowLog((rows) => [...rows.filter((r) => r.habitId !== habit.habitId), row]);
+      const row = (await provider.setHabitStatus(targetDate, habit.habitId, 'skipped')) as HabitLogRow;
+      setTargetDateLog((rows) => [...rows.filter((r) => r.habitId !== habit.habitId), row]);
     } catch (err) {
       setWriteError(`Failed to skip "${habit.label}": ${(err as Error).message}`);
     } finally {
@@ -289,10 +333,10 @@ export default function PlanTomorrow() {
     setBusySkipClassId(klass.classId);
     setWriteError('');
     try {
-      const row = (await provider.logClassStatus(klass.classId, currentPerson!.personId, tomorrow, 'skipped', {
+      const row = (await provider.logClassStatus(klass.classId, currentPerson!.personId, targetDate, 'skipped', {
         skippedBy: 'student',
       })) as ClassLogRow;
-      setTomorrowClassLog((rows) => [...rows.filter((r) => r.classId !== klass.classId), row]);
+      setTargetDateClassLog((rows) => [...rows.filter((r) => r.classId !== klass.classId), row]);
     } catch (err) {
       setWriteError(`Failed to skip "${klass.name}": ${(err as Error).message}`);
     } finally {
@@ -308,7 +352,7 @@ export default function PlanTomorrow() {
     setAddTaskBusy(true);
     setWriteError('');
     try {
-      const task = (await provider.addTask(currentPerson.personId, label, taskDue)) as Task;
+      const task = (await provider.addTask(currentPerson.personId, label, taskDue, Number(taskPointValue) || 1)) as Task;
       setTasks((rows) => [...rows, task]);
       setTaskLabel('');
       setTaskDue('');
@@ -319,6 +363,13 @@ export default function PlanTomorrow() {
     }
   }
 
+  // Always closes out literal `today`, regardless of which date is being
+  // planned — unchanged from the original "Plan Tomorrow" behavior. Only
+  // its visibility is gated (see isFutureDate / the JSX below): showing
+  // it while targetDate === today would mean showing "close out the day
+  // you're currently mid-way through arranging," which is exactly the
+  // premature-finalization risk this page generalizing to same-day use
+  // introduced. Not shown when planning today; shown when planning ahead.
   async function handleCloseOut() {
     setCloseOutBusy(true);
     setWriteError('');
@@ -411,13 +462,13 @@ export default function PlanTomorrow() {
     try {
       const row = (await provider.upsertDayPlanItem(
         currentPerson.personId,
-        tomorrow,
+        targetDate,
         itemType,
         itemId,
         sectionId,
         itemSortOrder
       )) as DayPlanItem;
-      setTomorrowPlanItems((rows) => [
+      setTargetDatePlanItems((rows) => [
         ...rows.filter((r) => !(r.itemType === itemType && r.itemId === itemId)),
         row,
       ]);
@@ -429,30 +480,30 @@ export default function PlanTomorrow() {
   const unclosedHabits = getUnclosedHabits(habits, habitLog) as Habit[];
   const openTasks = tasks.filter((task) => task.status === 'pending');
 
-  const planItemsBase: TomorrowPlanItemBase[] = [
+  const planItemsBase: PlanItemBase[] = [
     ...habits.map((habit) => ({ itemType: 'habit' as const, itemId: habit.habitId, sectionId: habit.sectionId, habit })),
     ...openTasks.map((task) => ({ itemType: 'task' as const, itemId: task.taskId, task })),
-    ...expectedClassesTomorrow.map((klass) => ({ itemType: 'class' as const, itemId: klass.classId, klass })),
+    ...expectedClassesForTargetDate.map((klass) => ({ itemType: 'class' as const, itemId: klass.classId, klass })),
   ];
   const grouped = useMemo(
     () =>
-      groupItemsBySections(planItemsBase, sections, tomorrowPlanItems) as {
+      groupItemsBySections(planItemsBase, sections, targetDatePlanItems) as {
         section: DaySection;
-        items: TomorrowPlanItem[];
+        items: PlanItem[];
       }[],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [habits, openTasks, expectedClassesTomorrow, sections, tomorrowPlanItems]
+    [habits, openTasks, expectedClassesForTargetDate, sections, targetDatePlanItems]
   );
 
-  function renderPlanItem(item: TomorrowPlanItem) {
+  function renderPlanItem(item: PlanItem) {
     if (item.itemType === 'habit') {
       const habit = item.habit;
-      const tomorrowStatus = tomorrowLog.find((row) => row.habitId === habit.habitId)?.status ?? null;
+      const status = targetDateLog.find((row) => row.habitId === habit.habitId)?.status ?? null;
       return (
         <div className="flex items-center justify-between gap-2">
           <span className="text-sm">{habit.label}</span>
-          {tomorrowStatus === 'skipped' ? (
-            <span className="text-xs text-muted-foreground">Skipped for tomorrow</span>
+          {status === 'skipped' ? (
+            <span className="text-xs text-muted-foreground">Skipped for {dateLabel.toLowerCase()}</span>
           ) : (
             <Button
               size="sm"
@@ -460,7 +511,7 @@ export default function PlanTomorrow() {
               disabled={busySkipHabitId === habit.habitId}
               onClick={() => handleSkip(habit)}
             >
-              Skip tomorrow
+              Skip {dateLabel.toLowerCase()}
             </Button>
           )}
         </div>
@@ -478,14 +529,14 @@ export default function PlanTomorrow() {
       );
     }
     const klass = item.klass;
-    const tomorrowStatus = tomorrowClassLog.find((row) => row.classId === klass.classId)?.status ?? null;
+    const status = targetDateClassLog.find((row) => row.classId === klass.classId)?.status ?? null;
     return (
       <div className="flex items-center justify-between gap-2">
         <span className="text-sm">
           {klass.startTime} — {klass.name}
         </span>
-        {tomorrowStatus === 'skipped' ? (
-          <span className="text-xs text-muted-foreground">Skipped for tomorrow</span>
+        {status === 'skipped' ? (
+          <span className="text-xs text-muted-foreground">Skipped for {dateLabel.toLowerCase()}</span>
         ) : (
           <Button
             size="sm"
@@ -493,7 +544,7 @@ export default function PlanTomorrow() {
             disabled={busySkipClassId === klass.classId}
             onClick={() => handleSkipClass(klass)}
           >
-            Skip tomorrow
+            Skip {dateLabel.toLowerCase()}
           </Button>
         )}
       </div>
@@ -506,7 +557,7 @@ export default function PlanTomorrow() {
 
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-3xl font-semibold">Plan Tomorrow</h1>
+          <h1 className="text-3xl font-semibold">Plan {dateLabel}</h1>
           <p className="text-sm text-muted-foreground">{status}</p>
         </div>
         {!isAuthed && (
@@ -514,6 +565,26 @@ export default function PlanTomorrow() {
             Sign in
           </Button>
         )}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          type="date"
+          value={targetDate}
+          onChange={(e) => e.target.value && goToDate(e.target.value)}
+          className="w-40"
+        />
+        <Button size="sm" variant="outline" disabled={targetDate === today} onClick={() => goToDate(today)}>
+          Today
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={targetDate === tomorrowISO()}
+          onClick={() => goToDate(tomorrowISO())}
+        >
+          Tomorrow
+        </Button>
       </div>
 
       {writeError && <p className="text-sm text-destructive">{writeError}</p>}
@@ -532,7 +603,7 @@ export default function PlanTomorrow() {
 
           <div>
             <p className="mb-2 text-sm text-muted-foreground">
-              Tomorrow's habits, classes, and open tasks — drag to arrange, skip a habit/class in advance
+              {dateLabel}'s habits, classes, and open tasks — drag to arrange, skip a habit/class in advance
               if it doesn't apply. New habits/classes are added from their own pages.
             </p>
             <DayPlanBoard grouped={grouped} onMove={handleMove} renderItem={renderPlanItem} />
@@ -551,6 +622,15 @@ export default function PlanTomorrow() {
                   onChange={(e) => setTaskLabel(e.target.value)}
                 />
                 <Input type="date" value={taskDue} onChange={(e) => setTaskDue(e.target.value)} className="w-40" />
+                <Input
+                  type="number"
+                  min="0"
+                  value={taskPointValue}
+                  onChange={(e) => setTaskPointValue(e.target.value)}
+                  className="w-16"
+                  title="Points earned per completion"
+                />
+                <span className="text-xs text-muted-foreground">pts</span>
                 <Button type="submit" disabled={addTaskBusy}>
                   Add Task
                 </Button>
@@ -558,23 +638,29 @@ export default function PlanTomorrow() {
             </CardContent>
           </Card>
 
-          <Card>
-            <CardHeader>
-              <CardTitle>Close out today</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              <p className="text-sm text-muted-foreground">
-                {unclosedHabits.length === 0
-                  ? 'Every active habit is already logged for today.'
-                  : `${unclosedHabits.length} habit(s) not logged yet today: ${unclosedHabits
-                      .map((h) => h.label)
-                      .join(', ')}`}
-              </p>
-              <Button onClick={handleCloseOut} disabled={unclosedHabits.length === 0 || closeOutBusy}>
-                Log missed habits for today
-              </Button>
-            </CardContent>
-          </Card>
+          {isFutureDate && (
+            <Card>
+              <CardHeader>
+                <CardTitle>Close out today</CardTitle>
+                <p className="text-sm text-muted-foreground">
+                  Only shown while planning ahead — closing out today from a view of today itself, a day
+                  still in progress, would finalize it prematurely.
+                </p>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                <p className="text-sm text-muted-foreground">
+                  {unclosedHabits.length === 0
+                    ? 'Every active habit is already logged for today.'
+                    : `${unclosedHabits.length} habit(s) not logged yet today: ${unclosedHabits
+                        .map((h) => h.label)
+                        .join(', ')}`}
+                </p>
+                <Button onClick={handleCloseOut} disabled={unclosedHabits.length === 0 || closeOutBusy}>
+                  Log missed habits for today
+                </Button>
+              </CardContent>
+            </Card>
+          )}
         </>
       )}
     </div>

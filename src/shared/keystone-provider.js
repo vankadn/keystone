@@ -11,20 +11,33 @@
 // setAccessToken() — this keeps their own signatures unchanged from the
 // Phase 1 mock contract; sign-in/token-refresh orchestration lives in
 // keystone-auth.js and the src/pages/*.tsx components, never here.
+//
+// First (Phase 12) use of the provider -> rules dependency the
+// architecture doc always allowed but this file never previously
+// exercised: pointsDeltaForTransition/computePointsBalance are pure
+// decisions (how many points a status change is worth, how a balance is
+// derived), so they belong in keystone-rules.js, not duplicated here —
+// this file still only calls out to that decision, never makes it.
+import { pointsDeltaForTransition, computePointsBalance, computeMilestoneGrantsDue } from './keystone-rules.js';
 
 export const SHEET_SCHEMA = {
   people: ['personId', 'name', 'theme', 'avatar'],
-  habits: ['habitId', 'personId', 'label', 'active', 'sectionId'],
-  tasks: ['taskId', 'personId', 'label', 'createdDate', 'dueDate', 'status', 'lastCarriedDate'],
+  habits: ['habitId', 'personId', 'label', 'active', 'sectionId', 'pointValue'],
+  tasks: ['taskId', 'personId', 'label', 'createdDate', 'dueDate', 'status', 'lastCarriedDate', 'pointValue'],
   habit_log: ['date', 'personId', 'habitId', 'status', 'checkpointId'],
   checkpoints: ['date', 'personId', 'checkpointId', 'label', 'itemIds', 'rewardMode', 'rewardIds', 'status'],
   reward_catalog: ['rewardId', 'personId', 'title', 'tags'],
-  weekly_rules: ['personId', 'metric', 'rewardId'],
+  weekly_rules: ['ruleId', 'personId', 'metric', 'rewardId'],
   reward_log: ['date', 'personId', 'checkpointIdOrWeekId', 'rewardChosen', 'grantedBy', 'status'],
-  classes: ['classId', 'personId', 'name', 'daysOfWeek', 'startTime', 'durationMinutes', 'active'],
+  classes: ['classId', 'personId', 'name', 'daysOfWeek', 'startTime', 'durationMinutes', 'active', 'pointValue'],
   class_log: ['classId', 'personId', 'date', 'status', 'rescheduledTo', 'skippedBy'],
   day_sections: ['sectionId', 'personId', 'name', 'sortOrder'],
   day_plan_items: ['personId', 'date', 'itemType', 'itemId', 'sectionId', 'itemSortOrder'],
+  points_log: ['personId', 'date', 'itemType', 'itemId', 'pointsEarned'],
+  points_rewards: ['rewardId', 'name', 'pointCost'],
+  points_redemption_log: ['personId', 'rewardId', 'date', 'pointsSpent'],
+  points_milestones: ['milestoneId', 'personId', 'pointInterval', 'rewardDescription'],
+  milestone_grants_log: ['personId', 'milestoneId', 'date', 'pointsBalanceAtGrant'],
 };
 
 // Seed data only — nothing in the domain/provider logic assumes exactly
@@ -181,12 +194,14 @@ export async function getHabits(personId) {
   const rows = await fetchSheetTab('habits');
   return rows
     .filter((row) => row.personId === personId)
-    .map((row) => ({ ...row, active: parseBoolean(row.active) }));
+    .map((row) => ({ ...row, active: parseBoolean(row.active), pointValue: Number(row.pointValue) || 1 }));
 }
 
 export async function getTasks(personId) {
   const rows = await fetchSheetTab('tasks');
-  return rows.filter((row) => row.personId === personId);
+  return rows
+    .filter((row) => row.personId === personId)
+    .map((row) => ({ ...row, pointValue: Number(row.pointValue) || 1 }));
 }
 
 export async function getHabitLog(personId, dateISO) {
@@ -227,6 +242,7 @@ export async function getClasses(personId) {
       daysOfWeek: parseList(row.daysOfWeek),
       durationMinutes: Number(row.durationMinutes) || 0,
       active: parseBoolean(row.active),
+      pointValue: Number(row.pointValue) || 1,
     }));
 }
 
@@ -265,9 +281,69 @@ export async function getDayPlan(personId, dateISO) {
 
 // ---------------------------------- Writes ----------------------------------
 
+// points_log is append-only, same convention as habit_log/class_log — a
+// completion (or its reversal, a negative pointsEarned) is a new row,
+// never an edit of a past one. Called from setHabitStatus/setTaskStatus/
+// logClassStatus below whenever their status change is worth a nonzero
+// point delta; not meant to be called directly from UI for a normal
+// completion (redeemPointsReward is the other, unrelated write path,
+// against points_redemption_log instead).
+export async function awardPoints(personId, dateISO, itemType, itemId, pointsEarned) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const row = { personId, date: dateISO, itemType, itemId, pointsEarned };
+  const values = SHEET_SCHEMA.points_log.map((col) => row[col] ?? '');
+  await appendRow(sheetId, accessToken, 'points_log', values);
+
+  await checkAndGrantMilestones(sheetId, accessToken, personId, dateISO);
+
+  return row;
+}
+
+// Auto-grant, no parent confirmation — deliberately unlike checkpoints/
+// points-catalog redemption (see Reward model in CLAUDE.md). Runs after
+// every awardPoints call (including reversals — a negative delta can
+// only ever reduce how many levels are achievable, never cause a false
+// grant, so it's safe/harmless to always check here rather than
+// requiring every awardPoints call site to remember a separate step).
+// Cheap no-op for the common case (a person with zero configured
+// milestones): only the points_milestones tab gets read before bailing
+// out, the other three tabs are only fetched if there's something to
+// actually evaluate.
+async function checkAndGrantMilestones(sheetId, accessToken, personId, dateISO) {
+  const milestonesRows = await fetchSheetTab('points_milestones');
+  const personMilestones = milestonesRows.filter((row) => row.personId === personId);
+  if (personMilestones.length === 0) return;
+
+  const [pointsLogRows, grantsRows, redemptionRows] = await Promise.all([
+    fetchSheetTab('points_log').then((rows) => rows.filter((row) => row.personId === personId)),
+    fetchSheetTab('milestone_grants_log').then((rows) => rows.filter((row) => row.personId === personId)),
+    fetchSheetTab('points_redemption_log').then((rows) => rows.filter((row) => row.personId === personId)),
+  ]);
+
+  const totalEarned = pointsLogRows.reduce((sum, row) => sum + (Number(row.pointsEarned) || 0), 0);
+  const { balance } = computePointsBalance(pointsLogRows, redemptionRows);
+
+  for (const milestone of personMilestones) {
+    const pointInterval = Number(milestone.pointInterval) || 0;
+    const existingGrantCount = grantsRows.filter((row) => row.milestoneId === milestone.milestoneId).length;
+    const grantsDue = computeMilestoneGrantsDue(totalEarned, pointInterval, existingGrantCount);
+    for (let i = 0; i < grantsDue; i += 1) {
+      const grantRow = { personId, milestoneId: milestone.milestoneId, date: dateISO, pointsBalanceAtGrant: balance };
+      const values = SHEET_SCHEMA.milestone_grants_log.map((col) => grantRow[col] ?? '');
+      await appendRow(sheetId, accessToken, 'milestone_grants_log', values);
+    }
+  }
+}
+
 // habit_log is append-only — every status change is a new row, never an
 // edit of a past row (see CLAUDE.md's Data model section).
-export async function setHabitStatus(dateISO, habitId, status) {
+// previousStatus (optional, defaults to null i.e. "no prior row") lets
+// pointsDeltaForTransition decide whether this change earns points,
+// reverses a previous award, or is a no-op — see keystone-rules.js for
+// why leaving 'done' must reverse rather than silently keep the points.
+export async function setHabitStatus(dateISO, habitId, status, previousStatus) {
   const accessToken = requireAccessToken();
   const sheetId = await getSheetId();
 
@@ -280,11 +356,21 @@ export async function setHabitStatus(dateISO, habitId, status) {
   const row = { date: dateISO, personId: habit.personId, habitId, status, checkpointId: '' };
   const values = SHEET_SCHEMA.habit_log.map((col) => row[col] ?? '');
   await appendRow(sheetId, accessToken, 'habit_log', values);
+
+  const pointValue = Number(habit.pointValue) || 1;
+  const delta = pointsDeltaForTransition(previousStatus, status, pointValue);
+  if (delta !== 0) {
+    await awardPoints(habit.personId, dateISO, 'habit', habitId, delta);
+  }
+
   return row;
 }
 
 // tasks rows mutate in place until done — this is the carry-forward
-// mechanism, there is no copying of rows from day to day.
+// mechanism, there is no copying of rows from day to day. Unlike
+// setHabitStatus, no previousStatus param is needed here — this function
+// already reads the existing row (task.status, below) before overwriting
+// it, so it has the prior status for free.
 export async function setTaskStatus(taskId, status) {
   const accessToken = requireAccessToken();
   const sheetId = await getSheetId();
@@ -301,6 +387,7 @@ export async function setTaskStatus(taskId, status) {
     obj[col] = existingRow[i] !== undefined ? existingRow[i] : '';
     return obj;
   }, {});
+  const previousStatus = task.status;
 
   task.status = status;
   if (status === 'pending') {
@@ -309,6 +396,13 @@ export async function setTaskStatus(taskId, status) {
 
   const values = SHEET_SCHEMA.tasks.map((col) => task[col] ?? '');
   await updateRow(sheetId, accessToken, 'tasks', sheetRowNumber, values);
+
+  const pointValue = Number(task.pointValue) || 1;
+  const delta = pointsDeltaForTransition(previousStatus, status, pointValue);
+  if (delta !== 0) {
+    await awardPoints(task.personId, todayISO(), 'task', taskId, delta);
+  }
+
   return task;
 }
 
@@ -354,7 +448,8 @@ export async function addPerson(name, theme) {
 }
 
 // One-off task add from Plan Tomorrow. dueDate is optional (''  if unset).
-export async function addTask(personId, label, dueDate) {
+// pointValue (Phase 12) defaults to 1 if not given.
+export async function addTask(personId, label, dueDate, pointValue) {
   const accessToken = requireAccessToken();
   const sheetId = await getSheetId();
 
@@ -366,6 +461,7 @@ export async function addTask(personId, label, dueDate) {
     dueDate: dueDate || '',
     status: 'pending',
     lastCarriedDate: '',
+    pointValue: Number(pointValue) || 1,
   };
   const values = SHEET_SCHEMA.tasks.map((col) => row[col] ?? '');
   await appendRow(sheetId, accessToken, 'tasks', values);
@@ -377,18 +473,26 @@ export async function addTask(personId, label, dueDate) {
 // sectionId is a habit's fixed home section (Phase 11 amendment) — unlike
 // Tasks/Classes, whose section placement is a free per-day choice living
 // only in day_plan_items, a habit's section is a property of the habit
-// definition itself. Required at creation, same as label.
-export async function addHabit(personId, label, sectionId) {
+// definition itself. Required at creation, same as label. pointValue
+// (Phase 12) defaults to 1 if not given.
+export async function addHabit(personId, label, sectionId, pointValue) {
   const accessToken = requireAccessToken();
   const sheetId = await getSheetId();
 
-  const row = { habitId: generateId('habit', label), personId, label, active: true, sectionId };
+  const row = {
+    habitId: generateId('habit', label),
+    personId,
+    label,
+    active: true,
+    sectionId,
+    pointValue: Number(pointValue) || 1,
+  };
   const values = SHEET_SCHEMA.habits.map((col) => row[col] ?? '');
   await appendRow(sheetId, accessToken, 'habits', values);
   return row;
 }
 
-export async function updateHabit(habitId, { label, sectionId }) {
+export async function updateHabit(habitId, { label, sectionId, pointValue }) {
   const accessToken = requireAccessToken();
   const sheetId = await getSheetId();
 
@@ -399,7 +503,7 @@ export async function updateHabit(habitId, { label, sectionId }) {
   const personId = existingRow[header.indexOf('personId')];
   const active = parseBoolean(existingRow[header.indexOf('active')]);
 
-  const row = { habitId, personId, label, active, sectionId };
+  const row = { habitId, personId, label, active, sectionId, pointValue: Number(pointValue) || 1 };
   await upsertRow(sheetId, accessToken, 'habits', 'habitId', habitId, row);
   return row;
 }
@@ -418,8 +522,9 @@ export async function setHabitActive(habitId, active) {
   const personId = existingRow[header.indexOf('personId')];
   const label = existingRow[header.indexOf('label')];
   const sectionId = existingRow[header.indexOf('sectionId')];
+  const pointValue = existingRow[header.indexOf('pointValue')];
 
-  const row = { habitId, personId, label, active, sectionId };
+  const row = { habitId, personId, label, active, sectionId, pointValue };
   await upsertRow(sheetId, accessToken, 'habits', 'habitId', habitId, row);
   return row;
 }
@@ -428,7 +533,8 @@ export async function setHabitActive(habitId, active) {
 // for the DDD reasoning) — weekday+time-bound, not daily-reset, with their
 // own log. CRUD follows the exact addHabit/updateHabit/setHabitActive
 // pattern below.
-export async function addClass(personId, name, daysOfWeek, startTime, durationMinutes) {
+// pointValue (Phase 12) defaults to 1 if not given.
+export async function addClass(personId, name, daysOfWeek, startTime, durationMinutes, pointValue) {
   const accessToken = requireAccessToken();
   const sheetId = await getSheetId();
 
@@ -440,13 +546,14 @@ export async function addClass(personId, name, daysOfWeek, startTime, durationMi
     startTime: startTime || '',
     durationMinutes: Number(durationMinutes) || 0,
     active: true,
+    pointValue: Number(pointValue) || 1,
   };
   const values = SHEET_SCHEMA.classes.map((col) => row[col] ?? '');
   await appendRow(sheetId, accessToken, 'classes', values);
   return { ...row, daysOfWeek: daysOfWeek || [] };
 }
 
-export async function updateClass(classId, { name, daysOfWeek, startTime, durationMinutes }) {
+export async function updateClass(classId, { name, daysOfWeek, startTime, durationMinutes, pointValue }) {
   const accessToken = requireAccessToken();
   const sheetId = await getSheetId();
 
@@ -465,6 +572,7 @@ export async function updateClass(classId, { name, daysOfWeek, startTime, durati
     startTime: startTime || '',
     durationMinutes: Number(durationMinutes) || 0,
     active,
+    pointValue: Number(pointValue) || 1,
   };
   await upsertRow(sheetId, accessToken, 'classes', 'classId', classId, row);
   return { ...row, daysOfWeek: daysOfWeek || [] };
@@ -486,8 +594,9 @@ export async function setClassActive(classId, active) {
   const daysOfWeek = existingRow[header.indexOf('daysOfWeek')];
   const startTime = existingRow[header.indexOf('startTime')];
   const durationMinutes = existingRow[header.indexOf('durationMinutes')];
+  const pointValue = existingRow[header.indexOf('pointValue')];
 
-  const row = { classId, personId, name, daysOfWeek, startTime, durationMinutes, active };
+  const row = { classId, personId, name, daysOfWeek, startTime, durationMinutes, active, pointValue };
   await upsertRow(sheetId, accessToken, 'classes', 'classId', classId, row);
   return { ...row, daysOfWeek: parseList(daysOfWeek) };
 }
@@ -501,6 +610,12 @@ export async function setClassActive(classId, active) {
 // (a distinct button in the UI), not the default, since who skipped
 // changes what the number means for attendance reporting (see
 // evaluateClassAttendance in keystone-rules.js).
+//
+// No previousStatus param, unlike setHabitStatus — a class's status is
+// one-way (Done/Skip/Reschedule, no toggle-back once logged for a date;
+// the UI hides the action buttons once class_log has a row), so 'leaving
+// done' can't happen here and points are only ever awarded, never
+// reversed, for a class.
 export async function logClassStatus(classId, personId, dateISO, status, options = {}) {
   const accessToken = requireAccessToken();
   const sheetId = await getSheetId();
@@ -515,6 +630,14 @@ export async function logClassStatus(classId, personId, dateISO, status, options
   };
   const values = SHEET_SCHEMA.class_log.map((col) => row[col] ?? '');
   await appendRow(sheetId, accessToken, 'class_log', values);
+
+  if (status === 'done') {
+    const classes = await fetchSheetTab('classes');
+    const klass = classes.find((c) => c.classId === classId);
+    const pointValue = Number(klass?.pointValue) || 1;
+    await awardPoints(personId, dateISO, 'class', classId, pointValue);
+  }
+
   return row;
 }
 
@@ -596,6 +719,146 @@ export async function upsertDayPlanItem(personId, dateISO, itemType, itemId, sec
     await updateRow(sheetId, accessToken, 'day_plan_items', sheetRowNumber, values);
   }
   return row;
+}
+
+// ---- Points system (Phase 12) — alongside, not replacing, the
+// checkpoint/parent-granted reward model. points_rewards is a shared
+// family catalog (no personId column, unlike reward_catalog which is
+// per-person) — deliberately: a points reward like "30 min extra screen
+// time" isn't tied to one person's identity the way a checkpoint reward
+// can be. See keystone-rules.js for the ledger-not-mutable-balance
+// reasoning and why points are only ever awarded via awardPoints
+// (above, called from setHabitStatus/setTaskStatus/logClassStatus). ----
+
+export async function getPointsRewards() {
+  const rows = await fetchSheetTab('points_rewards');
+  return rows.map((row) => ({ ...row, pointCost: Number(row.pointCost) || 0 }));
+}
+
+export async function addPointsReward(name, pointCost) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const row = { rewardId: generateId('preward', name), name, pointCost };
+  const values = SHEET_SCHEMA.points_rewards.map((col) => row[col] ?? '');
+  await appendRow(sheetId, accessToken, 'points_rewards', values);
+  return row;
+}
+
+export async function updatePointsReward(rewardId, name, pointCost) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const row = { rewardId, name, pointCost };
+  await upsertRow(sheetId, accessToken, 'points_rewards', 'rewardId', rewardId, row);
+  return row;
+}
+
+export async function deletePointsReward(rewardId) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+  return deleteRowById(sheetId, accessToken, 'points_rewards', 'rewardId', rewardId);
+}
+
+export async function getPointsRedemptionLog(personId) {
+  const rows = await fetchSheetTab('points_redemption_log');
+  return rows.filter((row) => row.personId === personId).map((row) => ({ ...row, pointsSpent: Number(row.pointsSpent) || 0 }));
+}
+
+// Derived, never stored — see computePointsBalance in keystone-rules.js
+// for why. The two fetchSheetTab calls below are issued synchronously
+// (before either awaits), so they batch into a single batchGet request
+// the same way a page's Promise.all([provider.getX(), ...]) does — see
+// fetchRawRows above.
+export async function getPointsBalance(personId) {
+  const [pointsLogRows, redemptionLogRows] = await Promise.all([
+    fetchSheetTab('points_log').then((rows) => rows.filter((row) => row.personId === personId)),
+    fetchSheetTab('points_redemption_log').then((rows) => rows.filter((row) => row.personId === personId)),
+  ]);
+  return computePointsBalance(pointsLogRows, redemptionLogRows);
+}
+
+// Validates balance >= the reward's pointCost before appending to
+// points_redemption_log — rejects (throws) rather than allowing a
+// negative balance. Not transactional (Sheets isn't), but this app has
+// no realistic concurrent-write scenario (one family, one sheet at a
+// time) to race against.
+export async function redeemPointsReward(personId, rewardId, dateISO) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const [balance, rewardsRows] = await Promise.all([getPointsBalance(personId), fetchSheetTab('points_rewards')]);
+  const reward = rewardsRows.find((r) => r.rewardId === rewardId);
+  if (!reward) {
+    throw new Error(`Unknown rewardId: ${rewardId}`);
+  }
+  const pointCost = Number(reward.pointCost) || 0;
+  if (balance.balance < pointCost) {
+    throw new Error(`Insufficient points: balance is ${balance.balance}, "${reward.name}" costs ${pointCost}`);
+  }
+
+  const row = { personId, rewardId, date: dateISO, pointsSpent: pointCost };
+  const values = SHEET_SCHEMA.points_redemption_log.map((col) => row[col] ?? '');
+  await appendRow(sheetId, accessToken, 'points_redemption_log', values);
+  return row;
+}
+
+// ---- Milestone auto-rewards (Phase 13) — points_milestones CRUD is a
+// per-person config, same pattern as points_rewards/day_sections.
+// Grant-side logic (deciding when a milestone fires) lives in
+// awardPoints/checkAndGrantMilestones above, not here — these are just
+// the config reads/writes. ----
+
+export async function getPointsMilestones(personId) {
+  const rows = await fetchSheetTab('points_milestones');
+  return rows
+    .filter((row) => row.personId === personId)
+    .map((row) => ({ ...row, pointInterval: Number(row.pointInterval) || 0 }));
+}
+
+export async function addPointsMilestone(personId, pointInterval, rewardDescription) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const row = {
+    milestoneId: generateId('milestone', rewardDescription),
+    personId,
+    pointInterval: Number(pointInterval) || 0,
+    rewardDescription,
+  };
+  const values = SHEET_SCHEMA.points_milestones.map((col) => row[col] ?? '');
+  await appendRow(sheetId, accessToken, 'points_milestones', values);
+  return row;
+}
+
+export async function updatePointsMilestone(milestoneId, pointInterval, rewardDescription) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const rawRows = await fetchRawRows('points_milestones');
+  const header = rawRows[0] || SHEET_SCHEMA.points_milestones;
+  const existingRow = rawRows.slice(1).find((row) => row[header.indexOf('milestoneId')] === milestoneId);
+  if (!existingRow) throw new Error(`Unknown milestoneId: ${milestoneId}`);
+  const personId = existingRow[header.indexOf('personId')];
+
+  const row = { milestoneId, personId, pointInterval: Number(pointInterval) || 0, rewardDescription };
+  await upsertRow(sheetId, accessToken, 'points_milestones', 'milestoneId', milestoneId, row);
+  return row;
+}
+
+export async function deletePointsMilestone(milestoneId) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+  return deleteRowById(sheetId, accessToken, 'points_milestones', 'milestoneId', milestoneId);
+}
+
+// Read-only — grants are auto-appended by checkAndGrantMilestones, never
+// written directly by UI/caller code.
+export async function getMilestoneGrantsLog(personId) {
+  const rows = await fetchSheetTab('milestone_grants_log');
+  return rows
+    .filter((row) => row.personId === personId)
+    .map((row) => ({ ...row, pointsBalanceAtGrant: Number(row.pointsBalanceAtGrant) || 0 }));
 }
 
 // Finds an existing row by idColumn === idValue and PUTs an update in
@@ -694,6 +957,44 @@ export async function deleteReward(rewardId) {
   const accessToken = requireAccessToken();
   const sheetId = await getSheetId();
   return deleteRowById(sheetId, accessToken, 'reward_catalog', 'rewardId', rewardId);
+}
+
+// ---- Weekly rules CRUD (per person) — closes the gap Phase 6 left open:
+// evaluateWeeklyRule (keystone-rules.js) always had the grammar/evaluation
+// logic, but there was no UI to create rows, only hand-editing the Sheet.
+// The metric string itself is composed by the UI via buildWeeklyMetric
+// (keystone-rules.js), never typed/edited directly here or on the page —
+// this layer just persists whatever string it's given. ----
+
+export async function addWeeklyRule(personId, metric, rewardId) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const row = { ruleId: generateId('rule', metric), personId, metric, rewardId: rewardId || '' };
+  const values = SHEET_SCHEMA.weekly_rules.map((col) => row[col] ?? '');
+  await appendRow(sheetId, accessToken, 'weekly_rules', values);
+  return row;
+}
+
+export async function updateWeeklyRule(ruleId, metric, rewardId) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const rawRows = await fetchRawRows('weekly_rules');
+  const header = rawRows[0] || SHEET_SCHEMA.weekly_rules;
+  const existingRow = rawRows.slice(1).find((row) => row[header.indexOf('ruleId')] === ruleId);
+  if (!existingRow) throw new Error(`Unknown ruleId: ${ruleId}`);
+  const personId = existingRow[header.indexOf('personId')];
+
+  const row = { ruleId, personId, metric, rewardId: rewardId || '' };
+  await upsertRow(sheetId, accessToken, 'weekly_rules', 'ruleId', ruleId, row);
+  return row;
+}
+
+export async function deleteWeeklyRule(ruleId) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+  return deleteRowById(sheetId, accessToken, 'weekly_rules', 'ruleId', ruleId);
 }
 
 // Parent-initiated, callable at any completion % — never automatic. Writes

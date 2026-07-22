@@ -50,19 +50,24 @@ function ClassRow({
 }: {
   klass: Class;
   busy: boolean;
-  onSave: (classId: string, fields: { name: string; daysOfWeek: string[]; startTime: string; durationMinutes: number }) => void;
+  onSave: (
+    classId: string,
+    fields: { name: string; daysOfWeek: string[]; startTime: string; durationMinutes: number; pointValue: number }
+  ) => void;
   onToggleActive: (classId: string, active: boolean) => void;
 }) {
   const [name, setName] = useState(klass.name);
   const [daysOfWeek, setDaysOfWeek] = useState<string[]>(klass.daysOfWeek);
   const [startTime, setStartTime] = useState(klass.startTime);
   const [durationMinutes, setDurationMinutes] = useState(String(klass.durationMinutes));
+  const [pointValue, setPointValue] = useState(String(klass.pointValue));
 
   const dirty =
     name.trim() !== klass.name ||
     daysOfWeek.join(',') !== klass.daysOfWeek.join(',') ||
     startTime !== klass.startTime ||
-    Number(durationMinutes) !== klass.durationMinutes;
+    Number(durationMinutes) !== klass.durationMinutes ||
+    Number(pointValue) !== klass.pointValue;
 
   return (
     <div className="space-y-2 border-b pb-3 last:border-b-0 last:pb-0">
@@ -93,6 +98,16 @@ function ClassRow({
           className="w-20"
         />
         <span className="text-xs text-muted-foreground">min</span>
+        <Input
+          type="number"
+          min="0"
+          value={pointValue}
+          disabled={busy}
+          onChange={(e) => setPointValue(e.target.value)}
+          className="w-16"
+          title="Points earned per completion"
+        />
+        <span className="text-xs text-muted-foreground">pts</span>
         {dirty && (
           <Button
             size="sm"
@@ -104,6 +119,7 @@ function ClassRow({
                 daysOfWeek,
                 startTime,
                 durationMinutes: Number(durationMinutes) || 0,
+                pointValue: Number(pointValue) || 1,
               })
             }
           >
@@ -133,6 +149,7 @@ export default function Classes() {
   const [newDays, setNewDays] = useState<string[]>([]);
   const [newStartTime, setNewStartTime] = useState('');
   const [newDuration, setNewDuration] = useState('30');
+  const [newPointValue, setNewPointValue] = useState('1');
   const [addBusy, setAddBusy] = useState(false);
 
   useEffect(() => {
@@ -196,7 +213,8 @@ export default function Classes() {
         name,
         newDays,
         newStartTime,
-        Number(newDuration) || 0
+        Number(newDuration) || 0,
+        Number(newPointValue) || 1
       )) as Class;
       setClasses((rows) => [...rows, klass]);
       setNewName('');
@@ -212,7 +230,7 @@ export default function Classes() {
 
   async function handleSave(
     classId: string,
-    fields: { name: string; daysOfWeek: string[]; startTime: string; durationMinutes: number }
+    fields: { name: string; daysOfWeek: string[]; startTime: string; durationMinutes: number; pointValue: number }
   ) {
     setBusyClassId(classId);
     setWriteError('');
@@ -290,6 +308,15 @@ export default function Classes() {
                     className="w-20"
                   />
                   <span className="text-xs text-muted-foreground">min</span>
+                  <Input
+                    type="number"
+                    min="0"
+                    value={newPointValue}
+                    onChange={(e) => setNewPointValue(e.target.value)}
+                    className="w-16"
+                    title="Points earned per completion"
+                  />
+                  <span className="text-xs text-muted-foreground">pts</span>
                   <Button type="submit" disabled={addBusy || newDays.length === 0}>
                     Add Class
                   </Button>

@@ -13,12 +13,16 @@ export interface Person {
 // at creation/edit time via /habits, unlike Task/Class section placement,
 // which is a free per-day choice living only in DayPlanItem. See
 // CLAUDE.md's Data model section for the full reasoning.
+// pointValue (Phase 12) is snapshotted into points_log at the moment a
+// completion earns points — editing it later never rewrites history, see
+// CLAUDE.md's Phase 12 for the full ledger reasoning.
 export interface Habit {
   habitId: string;
   personId: string;
   label: string;
   active: boolean;
   sectionId: string;
+  pointValue: number;
 }
 
 export interface Task {
@@ -29,6 +33,7 @@ export interface Task {
   dueDate: string;
   status: string;
   lastCarriedDate: string;
+  pointValue: number;
 }
 
 export interface HabitLogRow {
@@ -58,6 +63,7 @@ export interface Reward {
 }
 
 export interface WeeklyRule {
+  ruleId: string;
   personId: string;
   metric: string;
   rewardId: string;
@@ -82,6 +88,7 @@ export interface Class {
   startTime: string;
   durationMinutes: number;
   active: boolean;
+  pointValue: number;
 }
 
 export interface ClassLogRow {
@@ -115,4 +122,65 @@ export interface DayPlanItem {
   itemId: string;
   sectionId: string;
   itemSortOrder: number;
+}
+
+// Phase 12 — flat per-item points, alongside (not replacing) the
+// checkpoint/parent-granted reward model. See CLAUDE.md's Phase 12 for
+// the ledger-not-mutable-balance design decision.
+export interface PointsLogRow {
+  personId: string;
+  date: string;
+  itemType: PlanItemType;
+  itemId: string;
+  pointsEarned: number;
+}
+
+// No personId — a shared family catalog, unlike Reward (reward_catalog),
+// which is per-person. See keystone-provider.js's points_rewards section.
+export interface PointsReward {
+  rewardId: string;
+  name: string;
+  pointCost: number;
+}
+
+export interface PointsRedemptionRow {
+  personId: string;
+  rewardId: string;
+  date: string;
+  pointsSpent: number;
+}
+
+export interface PointsBalance {
+  earned: number;
+  spent: number;
+  balance: number;
+}
+
+// Phase 13 — auto-granted, no parent confirmation, deliberately unlike
+// checkpoints/points-catalog redemption. See CLAUDE.md's Phase 13 for
+// why (and for the redeem-safety reasoning behind how grants are
+// computed, in computeMilestoneGrantsDue).
+export interface PointsMilestone {
+  milestoneId: string;
+  personId: string;
+  pointInterval: number;
+  rewardDescription: string;
+}
+
+export interface MilestoneGrantRow {
+  personId: string;
+  milestoneId: string;
+  date: string;
+  pointsBalanceAtGrant: number;
+}
+
+// Return shape of calculateAchievementRate — one entry per item, not a
+// blended average. See CLAUDE.md's Phase 13 for the per-item-type
+// (habit/class/task) denominator conventions.
+export interface AchievementRateResult {
+  itemId: string;
+  label: string;
+  completed: number;
+  expected: number;
+  rate: number;
 }

@@ -1,8 +1,11 @@
 import { Link } from 'react-router-dom';
 
+// /plan defaults to tomorrow when no ?date= is given (see Plan.tsx) —
+// this link is deliberately bare, no date param, so it keeps pointing at
+// tomorrow exactly as the old dedicated /plan-tomorrow route did.
 const LINKS = [
   { to: '/', label: 'Today' },
-  { to: '/plan-tomorrow', label: 'Plan Tomorrow' },
+  { to: '/plan', label: 'Plan Tomorrow' },
   { to: '/checkpoints', label: 'Checkpoints' },
   { to: '/report', label: 'Report' },
   { to: '/habits', label: 'Habits' },
