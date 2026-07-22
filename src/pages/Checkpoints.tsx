@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import * as provider from '../lib/provider';
 import { isCheckpointReady, canGrantReward, resolveOpenRewardChoice } from '../lib/rules';
-import { requestSignIn } from '../lib/auth';
+import { requestSignIn, getCachedToken } from '../lib/auth';
 import type { Person, Habit, Task, HabitLogRow, Checkpoint, Reward } from '../lib/types';
 import { Button } from '@/components/ui/button';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
@@ -159,6 +159,14 @@ export default function Checkpoints() {
   async function reloadRewardCatalog(personId: string) {
     setRewardCatalog((await provider.getRewardCatalog(personId)) as Reward[]);
   }
+
+  useEffect(() => {
+    const cached = getCachedToken();
+    if (cached) {
+      provider.setAccessToken(cached);
+      setIsAuthed(true);
+    }
+  }, []);
 
   useEffect(() => {
     async function run() {

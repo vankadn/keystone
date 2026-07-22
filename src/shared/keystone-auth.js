@@ -85,6 +85,15 @@ export function requestSilentToken(clientId, scope) {
   return requestToken(clientId, scope, '', SILENT_TIMEOUT_MS);
 }
 
+// Pure sessionStorage read, no GIS call and no network — safe to call on
+// every page mount to rehydrate auth state after a refresh or client-side
+// nav. Returns null if there's no cached token or it's expired; callers
+// should fall back to showing "Sign in" (never auto-invoke requestSilentToken
+// from this, see keystone-auth.js's file header for why).
+export function getCachedToken() {
+  return loadCachedToken();
+}
+
 // Visible sign-in — call from a user gesture (e.g. a button click).
 export function requestSignIn(clientId, scope) {
   if (!window.google) {

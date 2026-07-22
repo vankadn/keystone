@@ -36,18 +36,23 @@ already allowlisted for the API key/OAuth client; other ports will get a
 403 from the Sheets API).
 
 **First time on a fresh Sheet:** go to `/setup` first, click **Sign in**,
-then **Initialize Sheet** — this creates the 8 tabs (and deletes the
+then **Initialize Sheet** — this creates all the tabs (and deletes the
 leftover default "Sheet1" if empty). Safe to re-run any time; it only
-adds what's missing. There is no manual tab creation in Google Sheets —
-the app always owns the sheet structure.
+adds what's missing, so re-run it again whenever an update adds a new
+tab (check CLAUDE.md's Data model for the current full list). There is no
+manual tab creation in Google Sheets — the app always owns the sheet
+structure.
 
-Then use the nav to get around: **Today** (`/`) for daily habit/task
-checkboxes and checkpoints, **Plan Tomorrow** for reviewing habits/open
-tasks and closing out the day, **Checkpoints** for grouping items into a
+Then use the nav to get around: **Today** (`/`) for daily habit/task/
+class checkboxes, sectioned and drag-reorderable, plus checkpoints,
+**Plan Tomorrow** for arranging tomorrow's habits/tasks/classes and
+closing out the day, **Checkpoints** for grouping items into a
 reward-bearing checkpoint and granting rewards, **Report** for the week's
 habit completion/task aging/reward history (read-only, no sign-in
-needed). `/setup` isn't in the nav — it's a one-time bootstrap page, not
-part of daily use.
+needed), **Habits** and **Classes** for managing those definitions, and
+**Setup** for (re-)running Sheet initialization — worth revisiting
+whenever you pull an update that adds a new tab, not just once at the
+very start.
 
 ### Common setup gotchas
 

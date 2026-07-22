@@ -1,8 +1,25 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import * as provider from '../lib/provider';
-import { isTaskStale, isCheckpointReady, isValidStatusTransition } from '../lib/rules';
-import { requestSignIn } from '../lib/auth';
-import type { Person, Habit, Task, HabitLogRow, Checkpoint } from '../lib/types';
+import {
+  isTaskStale,
+  isCheckpointReady,
+  isValidStatusTransition,
+  getExpectedClassesForDate,
+  groupItemsBySections,
+} from '../lib/rules';
+import { requestSignIn, getCachedToken } from '../lib/auth';
+import type {
+  Person,
+  Habit,
+  Task,
+  HabitLogRow,
+  Checkpoint,
+  Class,
+  ClassLogRow,
+  DaySection,
+  DayPlanItem,
+  PlanItemType,
+} from '../lib/types';
 import { Button } from '@/components/ui/button';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -10,6 +27,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Nav } from '../components/Nav';
+import { DayPlanBoard } from '../components/DayPlanBoard';
 
 const OAUTH_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 
@@ -18,6 +36,101 @@ function todayISO() {
 }
 
 const today = todayISO();
+
+type TodayPlanItemBase =
+  // sectionId here is read directly by groupItemsBySections (habits'
+  // fixed home section, see keystone-rules.js) — it's not just along for
+  // the ride on `habit`, the grouping function looks at the top-level field.
+  | { itemType: 'habit'; itemId: string; sectionId: string; habit: Habit }
+  | { itemType: 'task'; itemId: string; task: Task }
+  | { itemType: 'class'; itemId: string; klass: Class };
+
+type TodayPlanItem = TodayPlanItemBase & { itemSortOrder: number };
+
+// Same-day actions for one expected class: mark done, skip (defaults to
+// 'student'; "Skip (teacher)" is the one-extra-click exception path, not
+// a separate form), or reschedule to a new date/time. Once class_log has
+// a row for today, swap to a plain status line — same pattern as
+// Checkpoints' "Already granted" once an action has been taken.
+function ClassRow({
+  klass,
+  logRow,
+  busy,
+  onDone,
+  onSkip,
+  onReschedule,
+}: {
+  klass: Class;
+  logRow: ClassLogRow | null;
+  busy: boolean;
+  onDone: (klass: Class) => void;
+  onSkip: (klass: Class, skippedBy: 'student' | 'teacher') => void;
+  onReschedule: (klass: Class, rescheduledTo: string) => void;
+}) {
+  const [rescheduling, setRescheduling] = useState(false);
+  const [rescheduledTo, setRescheduledTo] = useState('');
+
+  if (logRow) {
+    const statusText =
+      logRow.status === 'done'
+        ? 'Done'
+        : logRow.status === 'skipped'
+          ? `Skipped (${logRow.skippedBy || 'student'})`
+          : `Rescheduled to ${logRow.rescheduledTo}`;
+    return (
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-sm">
+          {klass.startTime} — {klass.name}
+        </span>
+        <span className="text-xs text-muted-foreground">{statusText}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-1">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-sm">
+          {klass.startTime} — {klass.name}
+        </span>
+        <div className="flex gap-1">
+          <Button size="sm" disabled={busy} onClick={() => onDone(klass)}>
+            Done
+          </Button>
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => onSkip(klass, 'student')}>
+            Skip
+          </Button>
+          <Button size="sm" variant="ghost" disabled={busy} onClick={() => onSkip(klass, 'teacher')}>
+            Skip (teacher)
+          </Button>
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => setRescheduling((v) => !v)}>
+            Reschedule
+          </Button>
+        </div>
+      </div>
+      {rescheduling && (
+        <div className="flex items-center gap-2 pl-2">
+          <Input
+            type="datetime-local"
+            value={rescheduledTo}
+            onChange={(e) => setRescheduledTo(e.target.value)}
+            className="w-56"
+          />
+          <Button
+            size="sm"
+            disabled={busy || !rescheduledTo}
+            onClick={() => {
+              onReschedule(klass, rescheduledTo);
+              setRescheduling(false);
+            }}
+          >
+            Confirm
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function Today() {
   const [status, setStatus] = useState('Loading…');
@@ -31,6 +144,10 @@ export default function Today() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [habitLog, setHabitLog] = useState<HabitLogRow[]>([]);
   const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
+  const [expectedClasses, setExpectedClasses] = useState<Class[]>([]);
+  const [classLog, setClassLog] = useState<ClassLogRow[]>([]);
+  const [sections, setSections] = useState<DaySection[]>([]);
+  const [dayPlanItems, setDayPlanItems] = useState<DayPlanItem[]>([]);
 
   const [addPersonName, setAddPersonName] = useState('');
   const [addPersonTheme, setAddPersonTheme] = useState('Playful');
@@ -38,6 +155,15 @@ export default function Today() {
 
   const [busyHabitId, setBusyHabitId] = useState<string | null>(null);
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
+  const [busyClassId, setBusyClassId] = useState<string | null>(null);
+
+  useEffect(() => {
+    const cached = getCachedToken();
+    if (cached) {
+      provider.setAccessToken(cached);
+      setIsAuthed(true);
+    }
+  }, []);
 
   useEffect(() => {
     async function run() {
@@ -54,17 +180,34 @@ export default function Today() {
         return;
       }
 
-      const [habitsResult, tasksResult, habitLogResult, checkpointsResult] = (await Promise.all([
+      const [
+        habitsResult,
+        tasksResult,
+        habitLogResult,
+        checkpointsResult,
+        classesResult,
+        classLogResult,
+        sectionsResult,
+        dayPlanResult,
+      ] = (await Promise.all([
         provider.getHabits(person.personId),
         provider.getTasks(person.personId),
         provider.getHabitLog(person.personId, today),
         provider.getCheckpoints(person.personId, today),
-      ])) as [Habit[], Task[], HabitLogRow[], Checkpoint[]];
+        provider.getClasses(person.personId),
+        provider.getClassLog(person.personId, today),
+        provider.getDaySections(person.personId),
+        provider.getDayPlan(person.personId, today),
+      ])) as [Habit[], Task[], HabitLogRow[], Checkpoint[], Class[], ClassLogRow[], DaySection[], DayPlanItem[]];
 
-      setHabits(habitsResult);
+      setHabits(habitsResult.filter((h) => h.active));
       setTasks(tasksResult);
       setHabitLog(habitLogResult);
       setCheckpoints(checkpointsResult);
+      setExpectedClasses(getExpectedClassesForDate(classesResult, today) as Class[]);
+      setClassLog(classLogResult);
+      setSections(sectionsResult);
+      setDayPlanItems(dayPlanResult);
       setStatus(`Showing ${today} for ${person.name}`);
     }
 
@@ -143,6 +286,141 @@ export default function Today() {
     }
   }
 
+  async function handleClassDone(klass: Class) {
+    setBusyClassId(klass.classId);
+    setWriteError('');
+    try {
+      const row = (await provider.logClassStatus(klass.classId, currentPerson!.personId, today, 'done')) as ClassLogRow;
+      setClassLog((rows) => [...rows.filter((r) => r.classId !== klass.classId), row]);
+    } catch (err) {
+      setWriteError(`Failed to log "${klass.name}": ${(err as Error).message}`);
+    } finally {
+      setBusyClassId(null);
+    }
+  }
+
+  async function handleClassSkip(klass: Class, skippedBy: 'student' | 'teacher') {
+    setBusyClassId(klass.classId);
+    setWriteError('');
+    try {
+      const row = (await provider.logClassStatus(klass.classId, currentPerson!.personId, today, 'skipped', {
+        skippedBy,
+      })) as ClassLogRow;
+      setClassLog((rows) => [...rows.filter((r) => r.classId !== klass.classId), row]);
+    } catch (err) {
+      setWriteError(`Failed to skip "${klass.name}": ${(err as Error).message}`);
+    } finally {
+      setBusyClassId(null);
+    }
+  }
+
+  async function handleClassReschedule(klass: Class, rescheduledTo: string) {
+    setBusyClassId(klass.classId);
+    setWriteError('');
+    try {
+      const row = (await provider.logClassStatus(klass.classId, currentPerson!.personId, today, 'rescheduled', {
+        rescheduledTo,
+      })) as ClassLogRow;
+      setClassLog((rows) => [...rows.filter((r) => r.classId !== klass.classId), row]);
+    } catch (err) {
+      setWriteError(`Failed to reschedule "${klass.name}": ${(err as Error).message}`);
+    } finally {
+      setBusyClassId(null);
+    }
+  }
+
+  async function handleMove(itemType: PlanItemType, itemId: string, sectionId: string, itemSortOrder: number) {
+    if (!currentPerson) return;
+    setWriteError('');
+    try {
+      const row = (await provider.upsertDayPlanItem(
+        currentPerson.personId,
+        today,
+        itemType,
+        itemId,
+        sectionId,
+        itemSortOrder
+      )) as DayPlanItem;
+      setDayPlanItems((rows) => [...rows.filter((r) => !(r.itemType === itemType && r.itemId === itemId)), row]);
+    } catch (err) {
+      setWriteError(`Failed to move item: ${(err as Error).message}`);
+    }
+  }
+
+  const planItemsBase: TodayPlanItemBase[] = [
+    ...habits.map((habit) => ({ itemType: 'habit' as const, itemId: habit.habitId, sectionId: habit.sectionId, habit })),
+    ...tasks.map((task) => ({ itemType: 'task' as const, itemId: task.taskId, task })),
+    ...expectedClasses.map((klass) => ({ itemType: 'class' as const, itemId: klass.classId, klass })),
+  ];
+  const grouped = useMemo(
+    () =>
+      groupItemsBySections(planItemsBase, sections, dayPlanItems) as {
+        section: DaySection;
+        items: TodayPlanItem[];
+      }[],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [habits, tasks, expectedClasses, sections, dayPlanItems]
+  );
+
+  function renderPlanItem(item: TodayPlanItem) {
+    if (item.itemType === 'habit') {
+      const habit = item.habit;
+      const logRow = habitLog.find((row) => row.habitId === habit.habitId);
+      const habitStatus = logRow ? logRow.status : null;
+      return (
+        <div className="flex items-center gap-2">
+          {isAuthed && habitStatus !== 'skipped' && (
+            <Checkbox
+              checked={habitStatus === 'done'}
+              disabled={busyHabitId === habit.habitId}
+              onCheckedChange={(checked) => handleHabitToggle(habit, checked, habitStatus)}
+            />
+          )}
+          <span className="text-sm">
+            {habit.label} — {habitStatus || 'not logged'}
+          </span>
+        </div>
+      );
+    }
+    if (item.itemType === 'task') {
+      const task = item.task;
+      const stale = isTaskStale(task, today);
+      return (
+        <div className="flex items-center gap-2">
+          {isAuthed && (
+            <Checkbox
+              checked={task.status === 'done'}
+              disabled={busyTaskId === task.taskId}
+              onCheckedChange={(checked) => handleTaskToggle(task, checked)}
+            />
+          )}
+          <span className="text-sm">
+            {task.label} — {task.status}
+            {stale && <span className="text-destructive"> [stale]</span>}
+          </span>
+        </div>
+      );
+    }
+    const klass = item.klass;
+    if (!isAuthed) {
+      return (
+        <p className="text-sm">
+          {klass.startTime} — {klass.name}
+        </p>
+      );
+    }
+    return (
+      <ClassRow
+        klass={klass}
+        logRow={classLog.find((row) => row.classId === klass.classId) ?? null}
+        busy={busyClassId === klass.classId}
+        onDone={handleClassDone}
+        onSkip={handleClassSkip}
+        onReschedule={handleClassReschedule}
+      />
+    );
+  }
+
   return (
     <div className="mx-auto max-w-2xl space-y-6 p-6">
       <Nav personId={currentPerson?.personId ?? null} />
@@ -200,59 +478,25 @@ export default function Today() {
 
       {currentPerson && (
         <>
-          <Card>
-            <CardHeader>
-              <CardTitle>Habits</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              {habits.length === 0 && <p className="text-sm text-muted-foreground">No habits yet.</p>}
-              {habits.map((habit) => {
-                const logRow = habitLog.find((row) => row.habitId === habit.habitId);
-                const habitStatus = logRow ? logRow.status : null;
-                return (
-                  <div key={habit.habitId} className="flex items-center gap-2">
-                    {isAuthed && (
-                      <Checkbox
-                        checked={habitStatus === 'done'}
-                        disabled={busyHabitId === habit.habitId}
-                        onCheckedChange={(checked) => handleHabitToggle(habit, checked, habitStatus)}
-                      />
-                    )}
-                    <span className="text-sm">
-                      {habit.label} — {habitStatus || 'not logged'}
-                    </span>
-                  </div>
-                );
-              })}
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Tasks</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              {tasks.length === 0 && <p className="text-sm text-muted-foreground">No tasks yet.</p>}
-              {tasks.map((task) => {
-                const stale = isTaskStale(task, today);
-                return (
-                  <div key={task.taskId} className="flex items-center gap-2">
-                    {isAuthed && (
-                      <Checkbox
-                        checked={task.status === 'done'}
-                        disabled={busyTaskId === task.taskId}
-                        onCheckedChange={(checked) => handleTaskToggle(task, checked)}
-                      />
-                    )}
-                    <span className="text-sm">
-                      {task.label} — {task.status}
-                      {stale && <span className="text-destructive"> [stale]</span>}
-                    </span>
-                  </div>
-                );
-              })}
-            </CardContent>
-          </Card>
+          {isAuthed ? (
+            <DayPlanBoard grouped={grouped} onMove={handleMove} renderItem={renderPlanItem} />
+          ) : (
+            <div className="space-y-4">
+              {grouped.map(({ section, items }) => (
+                <Card key={section.sectionId}>
+                  <CardHeader>
+                    <CardTitle>{section.name}</CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-2">
+                    {items.length === 0 && <p className="text-sm text-muted-foreground">Nothing here.</p>}
+                    {items.map((item) => (
+                      <div key={`${item.itemType}:${item.itemId}`}>{renderPlanItem(item)}</div>
+                    ))}
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+          )}
 
           <Card>
             <CardHeader>

@@ -14,14 +14,23 @@
 
 export const SHEET_SCHEMA = {
   people: ['personId', 'name', 'theme', 'avatar'],
-  habits: ['habitId', 'personId', 'label', 'active'],
+  habits: ['habitId', 'personId', 'label', 'active', 'sectionId'],
   tasks: ['taskId', 'personId', 'label', 'createdDate', 'dueDate', 'status', 'lastCarriedDate'],
   habit_log: ['date', 'personId', 'habitId', 'status', 'checkpointId'],
   checkpoints: ['date', 'personId', 'checkpointId', 'label', 'itemIds', 'rewardMode', 'rewardIds', 'status'],
   reward_catalog: ['rewardId', 'personId', 'title', 'tags'],
   weekly_rules: ['personId', 'metric', 'rewardId'],
   reward_log: ['date', 'personId', 'checkpointIdOrWeekId', 'rewardChosen', 'grantedBy', 'status'],
+  classes: ['classId', 'personId', 'name', 'daysOfWeek', 'startTime', 'durationMinutes', 'active'],
+  class_log: ['classId', 'personId', 'date', 'status', 'rescheduledTo', 'skippedBy'],
+  day_sections: ['sectionId', 'personId', 'name', 'sortOrder'],
+  day_plan_items: ['personId', 'date', 'itemType', 'itemId', 'sectionId', 'itemSortOrder'],
 };
+
+// Seed data only — nothing in the domain/provider logic assumes exactly
+// 3 sections; the user can add/rename/reorder/delete beyond these later
+// (see addDaySection/updateDaySection/deleteDaySection below).
+const DEFAULT_DAY_SECTIONS = ['Morning', 'Afternoon', 'Evening'];
 
 const SHEETS_API_BASE = 'https://sheets.googleapis.com/v4/spreadsheets';
 
@@ -81,16 +90,62 @@ function rowsToObjects(rows) {
   );
 }
 
-async function fetchRawRows(tab) {
-  const sheetId = await getSheetId();
-  const apiKey = getApiKey();
-  const url = `${SHEETS_API_BASE}/${sheetId}/values/${tab}!A:Z?key=${apiKey}`;
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch ${tab}: ${response.status} ${response.statusText}`);
+// Coalesces every fetchRawRows() call issued within the same microtask tick
+// (e.g. a page's Promise.all([getPeople(), getHabits(), ...])) into one
+// spreadsheets.values.batchGet request instead of N separate
+// spreadsheets.values.get calls. Sheets' anonymous-read quota
+// ("Read requests per minute per user", 60/min) counts each HTTP call once
+// no matter how many ranges batchGet carries, so this cuts real request
+// volume roughly by the tab count per page load — added after hitting a
+// 429 RESOURCE_EXHAUSTED during ordinary manual testing (nav between a
+// couple pages was enough to add up). Relies on the standard
+// microtask-queue-drains-before-next-task guarantee: every fetchRawRows()
+// call fired synchronously (i.e. inside the same Promise.all literal)
+// registers its tab into `batch.tabs` before the queueMicrotask callback
+// that flushes the batch gets to run.
+let pendingBatch = null;
+
+function flushBatch(batch) {
+  if (pendingBatch === batch) pendingBatch = null;
+  (async () => {
+    try {
+      const sheetId = await getSheetId();
+      const apiKey = getApiKey();
+      const tabs = [...batch.tabs];
+      const ranges = tabs.map((tab) => `ranges=${encodeURIComponent(`${tab}!A:Z`)}`).join('&');
+      const url = `${SHEETS_API_BASE}/${sheetId}/values:batchGet?${ranges}&key=${apiKey}`;
+      const response = await fetch(url);
+      if (!response.ok) {
+        // response.statusText is often blank for these anon GETs, unlike
+        // the OAuth write path below — use the response body instead so
+        // this doesn't just say ": 400" with no diagnosable detail (e.g.
+        // "Unable to parse range" when a tab hasn't been created yet via
+        // /setup's Initialize Sheet).
+        const body = await response.text();
+        throw new Error(`Failed to fetch [${tabs.join(', ')}]: ${response.status} ${body}`);
+      }
+      const data = await response.json();
+      const valueRanges = data.valueRanges || [];
+      const rowsByTab = new Map(tabs.map((tab, i) => [tab, (valueRanges[i] && valueRanges[i].values) || []]));
+      batch.resolve(rowsByTab);
+    } catch (err) {
+      batch.reject(err);
+    }
+  })();
+}
+
+function fetchRawRows(tab) {
+  if (!pendingBatch) {
+    const batch = { tabs: new Set(), resolve: null, reject: null, promise: null };
+    batch.promise = new Promise((resolve, reject) => {
+      batch.resolve = resolve;
+      batch.reject = reject;
+    });
+    pendingBatch = batch;
+    queueMicrotask(() => flushBatch(batch));
   }
-  const data = await response.json();
-  return data.values || [];
+  pendingBatch.tabs.add(tab);
+  return pendingBatch.promise.then((rowsByTab) => rowsByTab.get(tab) || []);
 }
 
 async function fetchSheetTab(tab) {
@@ -163,6 +218,51 @@ export async function getRewardLog(personId) {
   return rows.filter((row) => row.personId === personId);
 }
 
+export async function getClasses(personId) {
+  const rows = await fetchSheetTab('classes');
+  return rows
+    .filter((row) => row.personId === personId)
+    .map((row) => ({
+      ...row,
+      daysOfWeek: parseList(row.daysOfWeek),
+      durationMinutes: Number(row.durationMinutes) || 0,
+      active: parseBoolean(row.active),
+    }));
+}
+
+export async function getClassLog(personId, dateISO) {
+  const rows = await fetchSheetTab('class_log');
+  return rows.filter((row) => row.personId === personId && row.date === dateISO);
+}
+
+// Mirrors getHabitLogRange — same caller-given-range convention, no
+// judgment about what the range should be.
+export async function getClassLogRange(personId, fromDateISO, toDateISO) {
+  const rows = await fetchSheetTab('class_log');
+  return rows.filter((row) => row.personId === personId && row.date >= fromDateISO && row.date <= toDateISO);
+}
+
+export async function getDaySections(personId) {
+  const rows = await fetchSheetTab('day_sections');
+  return rows
+    .filter((row) => row.personId === personId)
+    .map((row) => ({ ...row, sortOrder: Number(row.sortOrder) || 0 }));
+}
+
+// One day's arrangement — which section each habit/task/class instance
+// sits in and its order within that section. Separate from the
+// habits/tasks/classes definition tabs (those stay definitional: what
+// recurs); this is per-day placement (where it sits today). An item with
+// no row here yet isn't an error — see groupItemsBySections in
+// keystone-rules.js, which defaults unplaced items to the lowest-
+// sortOrder section rather than requiring everything be manually placed.
+export async function getDayPlan(personId, dateISO) {
+  const rows = await fetchSheetTab('day_plan_items');
+  return rows
+    .filter((row) => row.personId === personId && row.date === dateISO)
+    .map((row) => ({ ...row, itemSortOrder: Number(row.itemSortOrder) || 0 }));
+}
+
 // ---------------------------------- Writes ----------------------------------
 
 // habit_log is append-only — every status change is a new row, never an
@@ -228,6 +328,18 @@ function generateId(prefix, seed) {
   return `${slugify(seed) || prefix}-${suffix}`;
 }
 
+// Shared by addPerson below and initializeSheet's backfill loop — new
+// people get this immediately, people who predate day_sections get it
+// backfilled next time Initialize Sheet is (re-)run.
+async function seedDefaultDaySections(sheetId, accessToken, personId) {
+  for (let i = 0; i < DEFAULT_DAY_SECTIONS.length; i += 1) {
+    const name = DEFAULT_DAY_SECTIONS[i];
+    const row = { sectionId: generateId('section', name), personId, name, sortOrder: i };
+    const values = SHEET_SCHEMA.day_sections.map((col) => row[col] ?? '');
+    await appendRow(sheetId, accessToken, 'day_sections', values);
+  }
+}
+
 // Minimal Add Person slice pulled forward from Phase 8 — name + theme only,
 // no avatar yet. No edit/delete of people, no profile switcher.
 export async function addPerson(name, theme) {
@@ -237,6 +349,7 @@ export async function addPerson(name, theme) {
   const row = { personId: generateId('person', name), name, theme, avatar: '' };
   const values = SHEET_SCHEMA.people.map((col) => row[col] ?? '');
   await appendRow(sheetId, accessToken, 'people', values);
+  await seedDefaultDaySections(sheetId, accessToken, row.personId);
   return row;
 }
 
@@ -256,6 +369,232 @@ export async function addTask(personId, label, dueDate) {
   };
   const values = SHEET_SCHEMA.tasks.map((col) => row[col] ?? '');
   await appendRow(sheetId, accessToken, 'tasks', values);
+  return row;
+}
+
+// Habits are created going forward from the /habits page only — Today and
+// Plan Tomorrow just render whatever's active, no add-habit UI there.
+// sectionId is a habit's fixed home section (Phase 11 amendment) — unlike
+// Tasks/Classes, whose section placement is a free per-day choice living
+// only in day_plan_items, a habit's section is a property of the habit
+// definition itself. Required at creation, same as label.
+export async function addHabit(personId, label, sectionId) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const row = { habitId: generateId('habit', label), personId, label, active: true, sectionId };
+  const values = SHEET_SCHEMA.habits.map((col) => row[col] ?? '');
+  await appendRow(sheetId, accessToken, 'habits', values);
+  return row;
+}
+
+export async function updateHabit(habitId, { label, sectionId }) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const rawRows = await fetchRawRows('habits');
+  const header = rawRows[0] || SHEET_SCHEMA.habits;
+  const existingRow = rawRows.slice(1).find((row) => row[header.indexOf('habitId')] === habitId);
+  if (!existingRow) throw new Error(`Unknown habitId: ${habitId}`);
+  const personId = existingRow[header.indexOf('personId')];
+  const active = parseBoolean(existingRow[header.indexOf('active')]);
+
+  const row = { habitId, personId, label, active, sectionId };
+  await upsertRow(sheetId, accessToken, 'habits', 'habitId', habitId, row);
+  return row;
+}
+
+// Deactivating hides a habit from Today/Plan Tomorrow without touching its
+// habit_log history (append-only) — prefer this over deleting the habit
+// row outright, which would orphan past log rows' habitId reference.
+export async function setHabitActive(habitId, active) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const rawRows = await fetchRawRows('habits');
+  const header = rawRows[0] || SHEET_SCHEMA.habits;
+  const existingRow = rawRows.slice(1).find((row) => row[header.indexOf('habitId')] === habitId);
+  if (!existingRow) throw new Error(`Unknown habitId: ${habitId}`);
+  const personId = existingRow[header.indexOf('personId')];
+  const label = existingRow[header.indexOf('label')];
+  const sectionId = existingRow[header.indexOf('sectionId')];
+
+  const row = { habitId, personId, label, active, sectionId };
+  await upsertRow(sheetId, accessToken, 'habits', 'habitId', habitId, row);
+  return row;
+}
+
+// Classes are a distinct entity from habits (see CLAUDE.md's Classes phase
+// for the DDD reasoning) — weekday+time-bound, not daily-reset, with their
+// own log. CRUD follows the exact addHabit/updateHabit/setHabitActive
+// pattern below.
+export async function addClass(personId, name, daysOfWeek, startTime, durationMinutes) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const row = {
+    classId: generateId('class', name),
+    personId,
+    name,
+    daysOfWeek: (daysOfWeek || []).join(','),
+    startTime: startTime || '',
+    durationMinutes: Number(durationMinutes) || 0,
+    active: true,
+  };
+  const values = SHEET_SCHEMA.classes.map((col) => row[col] ?? '');
+  await appendRow(sheetId, accessToken, 'classes', values);
+  return { ...row, daysOfWeek: daysOfWeek || [] };
+}
+
+export async function updateClass(classId, { name, daysOfWeek, startTime, durationMinutes }) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const rawRows = await fetchRawRows('classes');
+  const header = rawRows[0] || SHEET_SCHEMA.classes;
+  const existingRow = rawRows.slice(1).find((row) => row[header.indexOf('classId')] === classId);
+  if (!existingRow) throw new Error(`Unknown classId: ${classId}`);
+  const personId = existingRow[header.indexOf('personId')];
+  const active = parseBoolean(existingRow[header.indexOf('active')]);
+
+  const row = {
+    classId,
+    personId,
+    name,
+    daysOfWeek: (daysOfWeek || []).join(','),
+    startTime: startTime || '',
+    durationMinutes: Number(durationMinutes) || 0,
+    active,
+  };
+  await upsertRow(sheetId, accessToken, 'classes', 'classId', classId, row);
+  return { ...row, daysOfWeek: daysOfWeek || [] };
+}
+
+// Deactivating hides a class from Today/Plan Tomorrow without touching its
+// class_log history — same append-only-history rationale as
+// setHabitActive above.
+export async function setClassActive(classId, active) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const rawRows = await fetchRawRows('classes');
+  const header = rawRows[0] || SHEET_SCHEMA.classes;
+  const existingRow = rawRows.slice(1).find((row) => row[header.indexOf('classId')] === classId);
+  if (!existingRow) throw new Error(`Unknown classId: ${classId}`);
+  const personId = existingRow[header.indexOf('personId')];
+  const name = existingRow[header.indexOf('name')];
+  const daysOfWeek = existingRow[header.indexOf('daysOfWeek')];
+  const startTime = existingRow[header.indexOf('startTime')];
+  const durationMinutes = existingRow[header.indexOf('durationMinutes')];
+
+  const row = { classId, personId, name, daysOfWeek, startTime, durationMinutes, active };
+  await upsertRow(sheetId, accessToken, 'classes', 'classId', classId, row);
+  return { ...row, daysOfWeek: parseList(daysOfWeek) };
+}
+
+// class_log is append-only, same convention as habit_log — done/skipped/
+// rescheduled all funnel through this one entry point. `options` carries
+// whichever field is specific to the status being logged: `rescheduledTo`
+// for 'rescheduled', `skippedBy` for 'skipped'. skippedBy defaults to
+// 'student' whenever a skip is logged without an explicit override —
+// teacher-cancelled sessions are the exception that has to be asked for
+// (a distinct button in the UI), not the default, since who skipped
+// changes what the number means for attendance reporting (see
+// evaluateClassAttendance in keystone-rules.js).
+export async function logClassStatus(classId, personId, dateISO, status, options = {}) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const row = {
+    classId,
+    personId,
+    date: dateISO,
+    status,
+    rescheduledTo: options.rescheduledTo || '',
+    skippedBy: status === 'skipped' ? options.skippedBy || 'student' : '',
+  };
+  const values = SHEET_SCHEMA.class_log.map((col) => row[col] ?? '');
+  await appendRow(sheetId, accessToken, 'class_log', values);
+  return row;
+}
+
+// ---- Day sections (Phase 11): per-person config, not global — matches
+// the existing config-over-one-off-logic convention. Groundwork for a
+// later calendar/specific-time view; this phase is just the section/
+// ordering data model, not a calendar grid. ----
+
+export async function addDaySection(personId, name, sortOrder) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const row = { sectionId: generateId('section', name), personId, name, sortOrder };
+  const values = SHEET_SCHEMA.day_sections.map((col) => row[col] ?? '');
+  await appendRow(sheetId, accessToken, 'day_sections', values);
+  return row;
+}
+
+export async function updateDaySection(sectionId, { name, sortOrder }) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const rawRows = await fetchRawRows('day_sections');
+  const header = rawRows[0] || SHEET_SCHEMA.day_sections;
+  const existingRow = rawRows.slice(1).find((row) => row[header.indexOf('sectionId')] === sectionId);
+  if (!existingRow) throw new Error(`Unknown sectionId: ${sectionId}`);
+  const personId = existingRow[header.indexOf('personId')];
+
+  const row = { sectionId, personId, name, sortOrder };
+  await upsertRow(sheetId, accessToken, 'day_sections', 'sectionId', sectionId, row);
+  return row;
+}
+
+// Deleting a section never touches day_plan_items — an item whose
+// sectionId no longer matches any existing section just falls back to
+// the lowest-sortOrder section on read (see groupItemsBySections in
+// keystone-rules.js), the same self-healing-on-read approach used
+// elsewhere (isCheckpointReady, getUnclosedHabits). No cascade needed,
+// and nothing "silently disappears" — it reappears in the fallback
+// section next load.
+export async function deleteDaySection(sectionId) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+  return deleteRowById(sheetId, accessToken, 'day_sections', 'sectionId', sectionId);
+}
+
+// day_plan_items has no single-column identity — personId+date+itemType+
+// itemId together identify "where does this specific item sit on this
+// day," so this upserts on that composite match rather than reusing the
+// single-idColumn upsertRow helper below. Rows here mutate in place as
+// the user drags/reassigns — unlike habit_log/class_log, this tab is NOT
+// append-only, since it's current placement, not history.
+export async function upsertDayPlanItem(personId, dateISO, itemType, itemId, sectionId, itemSortOrder) {
+  const accessToken = requireAccessToken();
+  const sheetId = await getSheetId();
+
+  const rawRows = await fetchRawRows('day_plan_items');
+  const header = rawRows[0] || SHEET_SCHEMA.day_plan_items;
+  const idx = {
+    personId: header.indexOf('personId'),
+    date: header.indexOf('date'),
+    itemType: header.indexOf('itemType'),
+    itemId: header.indexOf('itemId'),
+  };
+  const dataRowIndex = rawRows.slice(1).findIndex(
+    (row) =>
+      row[idx.personId] === personId &&
+      row[idx.date] === dateISO &&
+      row[idx.itemType] === itemType &&
+      row[idx.itemId] === itemId
+  );
+
+  const row = { personId, date: dateISO, itemType, itemId, sectionId, itemSortOrder };
+  const values = SHEET_SCHEMA.day_plan_items.map((col) => row[col] ?? '');
+  if (dataRowIndex === -1) {
+    await appendRow(sheetId, accessToken, 'day_plan_items', values);
+  } else {
+    const sheetRowNumber = dataRowIndex + 2; // +1 header, +1 1-indexing
+    await updateRow(sheetId, accessToken, 'day_plan_items', sheetRowNumber, values);
+  }
   return row;
 }
 
@@ -365,7 +704,9 @@ export async function grantReward(checkpointIdOrWeekId, rewardChosen, grantedBy)
   const sheetId = await getSheetId();
 
   const checkpointRows = await fetchSheetTab('checkpoints');
-  const checkpoint = checkpointRows.find((cp) => cp.checkpointId === checkpointIdOrWeekId);
+  const checkpoint = checkpointRows
+    .map((row) => ({ ...row, itemIds: parseList(row.itemIds), rewardIds: parseList(row.rewardIds) }))
+    .find((cp) => cp.checkpointId === checkpointIdOrWeekId);
 
   const row = {
     date: todayISO(),
@@ -437,6 +778,11 @@ async function isTabEmpty(sheetId, accessToken, tabName) {
   return !data.values || data.values.length === 0;
 }
 
+async function readTabValues(sheetId, accessToken, tabName) {
+  const data = await sheetsApiRequest(`${sheetId}/values/${tabName}`, accessToken);
+  return data.values || [];
+}
+
 function appendRow(sheetId, accessToken, tabName, values) {
   return sheetsApiRequest(`${sheetId}/values/${tabName}!A:Z:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, accessToken, {
     method: 'POST',
@@ -491,5 +837,26 @@ export async function initializeSheet(sheetId, accessToken) {
     }
   }
 
-  return { created, alreadyExisted, deleted };
+  // Backfill default day_sections for any person who predates this
+  // feature (addPerson seeds new people immediately — see
+  // seedDefaultDaySections above — this only catches the gap for people
+  // created before day_sections existed). Idempotent: skips anyone who
+  // already has at least one day_sections row.
+  const peopleValues = await readTabValues(sheetId, accessToken, 'people');
+  const daySectionValues = await readTabValues(sheetId, accessToken, 'day_sections');
+  const peopleHeader = peopleValues[0] || SHEET_SCHEMA.people;
+  const sectionHeader = daySectionValues[0] || SHEET_SCHEMA.day_sections;
+  const personIdIndex = peopleHeader.indexOf('personId');
+  const sectionPersonIdIndex = sectionHeader.indexOf('personId');
+  const peopleWithSections = new Set(daySectionValues.slice(1).map((row) => row[sectionPersonIdIndex]));
+
+  const seededDaySectionsFor = [];
+  for (const row of peopleValues.slice(1)) {
+    const personId = row[personIdIndex];
+    if (peopleWithSections.has(personId)) continue;
+    await seedDefaultDaySections(sheetId, accessToken, personId);
+    seededDaySectionsFor.push(personId);
+  }
+
+  return { created, alreadyExisted, deleted, seededDaySectionsFor };
 }

@@ -89,7 +89,7 @@ export default function Report() {
         <CardContent className="space-y-1">
           {habits.length === 0 && <p className="text-sm text-muted-foreground">No habits yet.</p>}
           {habits.map((habit) => {
-            const { doneCount, windowDays, rate } = computeHabitCompletionRate(
+            const { doneCount, windowDays, skippedCount, rate } = computeHabitCompletionRate(
               habit,
               habitLogRange,
               today,
@@ -98,6 +98,7 @@ export default function Report() {
             return (
               <p key={habit.habitId} className="text-sm">
                 {habit.label}: {doneCount}/{windowDays} ({Math.round(rate * 100)}%)
+                {skippedCount > 0 && ` — ${skippedCount} skipped`}
               </p>
             );
           })}
@@ -134,6 +135,7 @@ export default function Report() {
             return (
               <p key={i} className="text-sm">
                 {rule.metric}: {result.error ?? `${result.count}/${result.target} — ${result.met ? 'met ✅' : 'not met'}`}
+                {!result.error && result.skippedCount > 0 && ` (${result.skippedCount} skipped)`}
               </p>
             );
           })}

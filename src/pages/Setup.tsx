@@ -1,20 +1,31 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { initializeSheet } from '../lib/provider';
-import { requestSignIn } from '../lib/auth';
+import { requestSignIn, getCachedToken } from '../lib/auth';
 import { Button } from '@/components/ui/button';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
+import { Nav } from '../components/Nav';
 
 const OAUTH_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 
-// One-time (idempotent-repeatable) sheet setup — not in the daily Nav,
-// same as the old app/setup.html. Whoever bootstraps a bring-your-own
-// sheet hits this page first.
+// Idempotent-repeatable sheet setup — re-run whenever SHEET_SCHEMA gains a
+// new tab (Classes, day_sections, day_plan_items, ... have all needed
+// this so far), not just once at bootstrap. Now in the Nav for exactly
+// that reason — see Nav.tsx for why keeping it out caused a real bug
+// (lost sign-in state from reaching it via a fresh browser tab).
 export default function Setup() {
   const [status, setStatus] = useState('Not signed in.');
   const [accessToken, setAccessToken] = useState<string | null>(null);
   const [result, setResult] = useState('');
   const [signInBusy, setSignInBusy] = useState(false);
   const [initBusy, setInitBusy] = useState(false);
+
+  useEffect(() => {
+    const cached = getCachedToken();
+    if (cached) {
+      setAccessToken(cached);
+      setStatus('Signed in (restored). Ready to initialize.');
+    }
+  }, []);
 
   async function handleSignIn() {
     setSignInBusy(true);
@@ -51,6 +62,7 @@ export default function Setup() {
 
   return (
     <div className="mx-auto max-w-2xl space-y-6 p-6">
+      <Nav personId={null} />
       <h1 className="text-3xl font-semibold">Setup</h1>
       <Card>
         <CardHeader>

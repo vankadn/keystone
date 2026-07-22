@@ -4,6 +4,8 @@ import PlanTomorrow from './pages/PlanTomorrow';
 import Checkpoints from './pages/Checkpoints';
 import Report from './pages/Report';
 import Setup from './pages/Setup';
+import Habits from './pages/Habits';
+import Classes from './pages/Classes';
 
 function App() {
   return (
@@ -13,6 +15,8 @@ function App() {
         <Route path="/plan-tomorrow" element={<PlanTomorrow />} />
         <Route path="/checkpoints" element={<Checkpoints />} />
         <Route path="/report" element={<Report />} />
+        <Route path="/habits" element={<Habits />} />
+        <Route path="/classes" element={<Classes />} />
         <Route path="/setup" element={<Setup />} />
       </Routes>
     </BrowserRouter>
