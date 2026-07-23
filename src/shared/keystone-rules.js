@@ -203,14 +203,50 @@ export function evaluateClassAttendance(klass, classLogRows, todayISO, windowDay
 // (see CLAUDE.md's Future scope section) at the loose/section-grouping
 // level; specific-time/calendar-grid binding is still future scope. ----
 
+// Given sections sorted by their own configured `startTime` ("HH:MM",
+// lexicographically comparable in that format), finds which section a
+// clock time falls into: the latest section whose startTime doesn't
+// exceed it. Only the START time is considered — an item spanning two
+// sections (e.g. starts in Morning, runs into Afternoon) is bucketed by
+// when it *starts*, per the reported expectation, not by duration/end
+// time, which this function doesn't even receive. Sections with no
+// startTime configured (e.g. a custom section the user never set a time
+// for) are ignored for this purpose; returns null if none qualify (no
+// sections have a startTime at all, or the time is before all of them),
+// letting the caller fall back to the plain lowest-sortOrder default.
+function sectionForTime(sortedSections, timeHHMM) {
+  if (!timeHHMM) return null;
+  const withTimes = [...sortedSections]
+    .filter((s) => s.startTime)
+    .sort((a, b) => (a.startTime < b.startTime ? -1 : a.startTime > b.startTime ? 1 : 0));
+  let best = null;
+  for (const section of withTimes) {
+    if (section.startTime <= timeHHMM) best = section;
+    else break;
+  }
+  return best;
+}
+
 // Groups a day's habit/task/class items into their assigned day_sections,
 // ordered within each section. An item with no day_plan_items row yet for
 // this date — brand new, or a date nobody's explicitly arranged — defaults
 // to the lowest-sortOrder section rather than being unplaceable, so it
-// still shows up somewhere instead of erroring or silently vanishing.
-// Same fallback covers an item whose stored sectionId no longer matches
-// any current section (i.e. that section was deleted) — see
-// deleteDaySection in keystone-provider.js for why no cascade is needed.
+// still shows up somewhere instead of erroring or silently vanishing —
+// EXCEPT a Class, which has its own scheduled `startTime`: an unplaced
+// Class defaults into whichever section's own `startTime` it actually
+// falls into (see sectionForTime above), not blindly the lowest-sortOrder
+// one. That distinction exists because sortOrder only ever controlled
+// *display* order and never had any inherent time meaning — a 16:30 class
+// defaulting into a section named "Morning" (because Morning happened to
+// be sortOrder 0) was a real reported bug, not a hypothetical. Habits and
+// Tasks have no clock time of their own, so they're unaffected: Habits
+// keep their fixed-section rule below, Tasks keep the plain
+// lowest-sortOrder fallback.
+//
+// Same lowest-sortOrder fallback also covers an item whose stored
+// sectionId no longer matches any current section (i.e. that section was
+// deleted) — see deleteDaySection in keystone-provider.js for why no
+// cascade is needed.
 //
 // Habits vs. Tasks/Classes are asymmetric here (Phase 11 amendment): a
 // Habit's section is a fixed property of the habit *definition*
@@ -233,6 +269,10 @@ export function groupItemsBySections(items, sections, dayPlanItems) {
     }
     if (planRow && validSectionIds.has(planRow.sectionId)) {
       return { sectionId: planRow.sectionId, itemSortOrder: planRow.itemSortOrder };
+    }
+    if (item.itemType === 'class') {
+      const timeSection = sectionForTime(sortedSections, item.startTime);
+      if (timeSection) return { sectionId: timeSection.sectionId, itemSortOrder: Number.MAX_SAFE_INTEGER };
     }
     return { sectionId: defaultSectionId, itemSortOrder: Number.MAX_SAFE_INTEGER };
   };

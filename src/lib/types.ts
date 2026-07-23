@@ -102,11 +102,18 @@ export interface ClassLogRow {
 
 // Phase 11 — groundwork for a later calendar/specific-time view, not that
 // view itself. See CLAUDE.md's Phase 11 for the full reasoning.
+// startTime ("HH:MM", optional/blank for a custom section nobody's set a
+// time on) is the section's own clock-time boundary, used to default-
+// bucket an unplaced Class (which has its own startTime) into whichever
+// section it actually falls into — see groupItemsBySections in
+// keystone-rules.js. sortOrder is purely display order and has no time
+// meaning of its own.
 export interface DaySection {
   sectionId: string;
   personId: string;
   name: string;
   sortOrder: number;
+  startTime: string;
 }
 
 export type PlanItemType = 'habit' | 'task' | 'class';

@@ -23,20 +23,28 @@ import { DayPlanBoard } from '../components/DayPlanBoard';
 const OAUTH_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 const DATE_PARAM_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
+// Local calendar date, NOT `new Date().toISOString()` — see
+// keystone-provider.js's todayISO() for why (UTC disagrees with the
+// user's actual local day for part of every day in any timezone ahead
+// of UTC — this is what caused a Tue/Thu class to show up on the user's
+// actual Wednesday).
 function todayISO() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function tomorrowISO() {
   const d = new Date();
-  d.setUTCDate(d.getUTCDate() + 1);
-  return d.toISOString().slice(0, 10);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
+// Safe to do this arithmetic in UTC, unlike todayISO() above — this
+// operates on an already-correct date *string* (not "now"), and
+// T00:00:00Z is just a stable anchor for day-granularity math, not a
+// claim about the user's timezone.
 function addDaysISO(dateISO: string, days: number) {
   const d = new Date(`${dateISO}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
+}
+
+function tomorrowISO() {
+  return addDaysISO(todayISO(), 1);
 }
 
 const today = todayISO();
@@ -55,24 +63,30 @@ function targetDateLabel(dateISO: string) {
 }
 
 type PlanItemBase =
-  // sectionId here is read directly by groupItemsBySections (habits'
-  // fixed home section, see keystone-rules.js) — it's not just along for
-  // the ride on `habit`, the grouping function looks at the top-level field.
+  // sectionId/startTime here are read directly by groupItemsBySections
+  // (habits' fixed home section, classes' time-based default section —
+  // see keystone-rules.js) — they're not just along for the ride on
+  // `habit`/`klass`, the grouping function looks at these top-level
+  // fields specifically, not the nested object.
   | { itemType: 'habit'; itemId: string; sectionId: string; habit: Habit }
   | { itemType: 'task'; itemId: string; task: Task }
-  | { itemType: 'class'; itemId: string; klass: Class };
+  | { itemType: 'class'; itemId: string; startTime: string; klass: Class };
 
 type PlanItem = PlanItemBase & { itemSortOrder: number };
 
 // Inline section rename/reorder/delete — small enough to live at the top
 // of Plan rather than a separate settings page, matching where
-// arrangement actually happens.
+// arrangement actually happens. startTime is what an unplaced Class
+// defaults into by clock time (see groupItemsBySections in
+// keystone-rules.js) — optional; leaving it blank just means this
+// section is never chosen as a time-based default, only ever reached by
+// dragging something into it or an item's fixed-section rule.
 function SectionRow({
   section,
   busy,
   canMoveUp,
   canMoveDown,
-  onRename,
+  onSave,
   onMoveUp,
   onMoveDown,
   onDelete,
@@ -81,23 +95,32 @@ function SectionRow({
   busy: boolean;
   canMoveUp: boolean;
   canMoveDown: boolean;
-  onRename: (sectionId: string, name: string) => void;
+  onSave: (sectionId: string, name: string, startTime: string) => void;
   onMoveUp: () => void;
   onMoveDown: () => void;
   onDelete: () => void;
 }) {
   const [name, setName] = useState(section.name);
-  const dirty = name.trim().length > 0 && name.trim() !== section.name;
+  const [startTime, setStartTime] = useState(section.startTime);
+  const dirty = (name.trim().length > 0 && name.trim() !== section.name) || startTime !== section.startTime;
 
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex flex-wrap items-center gap-2">
       <Input value={name} disabled={busy} onChange={(e) => setName(e.target.value)} className="flex-1" />
+      <Input
+        type="time"
+        value={startTime}
+        disabled={busy}
+        onChange={(e) => setStartTime(e.target.value)}
+        className="w-28"
+        title="Starts at (used to default-place a class scheduled at this time or later)"
+      />
       {dirty && (
         <Button
           size="sm"
           variant="outline"
           disabled={busy}
-          onClick={() => onRename(section.sectionId, name.trim())}
+          onClick={() => onSave(section.sectionId, name.trim(), startTime)}
         >
           Save
         </Button>
@@ -119,20 +142,21 @@ function SectionManager({
   sections,
   busySectionId,
   onAdd,
-  onRename,
+  onSave,
   onMoveUp,
   onMoveDown,
   onDelete,
 }: {
   sections: DaySection[];
   busySectionId: string | null;
-  onAdd: (name: string) => void;
-  onRename: (sectionId: string, name: string) => void;
+  onAdd: (name: string, startTime: string) => void;
+  onSave: (sectionId: string, name: string, startTime: string) => void;
   onMoveUp: (sectionId: string) => void;
   onMoveDown: (sectionId: string) => void;
   onDelete: (sectionId: string) => void;
 }) {
   const [newName, setNewName] = useState('');
+  const [newStartTime, setNewStartTime] = useState('');
   const sorted = [...sections].sort((a, b) => a.sortOrder - b.sortOrder);
 
   return (
@@ -142,6 +166,9 @@ function SectionManager({
         <p className="text-sm text-muted-foreground">
           Add, rename, reorder, or remove the sections habits/tasks/classes get grouped into below.
           Deleting a section doesn't delete its items — they fall back to the first remaining section.
+          A section's "starts at" time is used to auto-place a class scheduled at or after that time
+          (and before the next section's start) — the class's own scheduled time decides this, not
+          which section you drag it into by hand, unless you've dragged it somewhere already.
         </p>
       </CardHeader>
       <CardContent className="space-y-2">
@@ -152,23 +179,31 @@ function SectionManager({
             busy={busySectionId === section.sectionId}
             canMoveUp={i > 0}
             canMoveDown={i < sorted.length - 1}
-            onRename={onRename}
+            onSave={onSave}
             onMoveUp={() => onMoveUp(section.sectionId)}
             onMoveDown={() => onMoveDown(section.sectionId)}
             onDelete={() => onDelete(section.sectionId)}
           />
         ))}
         <form
-          className="flex gap-2 pt-2"
+          className="flex flex-wrap gap-2 pt-2"
           onSubmit={(e) => {
             e.preventDefault();
             const name = newName.trim();
             if (!name) return;
-            onAdd(name);
+            onAdd(name, newStartTime);
             setNewName('');
+            setNewStartTime('');
           }}
         >
           <Input placeholder="New section name" value={newName} onChange={(e) => setNewName(e.target.value)} />
+          <Input
+            type="time"
+            value={newStartTime}
+            onChange={(e) => setNewStartTime(e.target.value)}
+            className="w-28"
+            title="Starts at (optional)"
+          />
           <Button type="submit" disabled={busySectionId === 'add'}>
             Add Section
           </Button>
@@ -386,13 +421,18 @@ export default function Plan() {
     }
   }
 
-  async function handleAddSection(name: string) {
+  async function handleAddSection(name: string, startTime: string) {
     if (!currentPerson) return;
     setBusySectionId('add');
     setWriteError('');
     try {
       const nextSortOrder = sections.length === 0 ? 0 : Math.max(...sections.map((s) => s.sortOrder)) + 1;
-      const section = (await provider.addDaySection(currentPerson.personId, name, nextSortOrder)) as DaySection;
+      const section = (await provider.addDaySection(
+        currentPerson.personId,
+        name,
+        nextSortOrder,
+        startTime
+      )) as DaySection;
       setSections((rows) => [...rows, section]);
     } catch (err) {
       setWriteError(`Failed to add section: ${(err as Error).message}`);
@@ -401,16 +441,16 @@ export default function Plan() {
     }
   }
 
-  async function handleRenameSection(sectionId: string, name: string) {
+  async function handleSaveSection(sectionId: string, name: string, startTime: string) {
     const section = sections.find((s) => s.sectionId === sectionId);
     if (!section) return;
     setBusySectionId(sectionId);
     setWriteError('');
     try {
-      await provider.updateDaySection(sectionId, { name, sortOrder: section.sortOrder });
-      setSections((rows) => rows.map((s) => (s.sectionId === sectionId ? { ...s, name } : s)));
+      await provider.updateDaySection(sectionId, { name, sortOrder: section.sortOrder, startTime });
+      setSections((rows) => rows.map((s) => (s.sectionId === sectionId ? { ...s, name, startTime } : s)));
     } catch (err) {
-      setWriteError(`Failed to rename section: ${(err as Error).message}`);
+      setWriteError(`Failed to update section: ${(err as Error).message}`);
     } finally {
       setBusySectionId(null);
     }
@@ -427,8 +467,16 @@ export default function Plan() {
     setBusySectionId(sectionId);
     setWriteError('');
     try {
-      await provider.updateDaySection(current.sectionId, { name: current.name, sortOrder: neighbor.sortOrder });
-      await provider.updateDaySection(neighbor.sectionId, { name: neighbor.name, sortOrder: current.sortOrder });
+      await provider.updateDaySection(current.sectionId, {
+        name: current.name,
+        sortOrder: neighbor.sortOrder,
+        startTime: current.startTime,
+      });
+      await provider.updateDaySection(neighbor.sectionId, {
+        name: neighbor.name,
+        sortOrder: current.sortOrder,
+        startTime: neighbor.startTime,
+      });
       setSections((rows) =>
         rows.map((s) => {
           if (s.sectionId === current.sectionId) return { ...s, sortOrder: neighbor.sortOrder };
@@ -483,7 +531,12 @@ export default function Plan() {
   const planItemsBase: PlanItemBase[] = [
     ...habits.map((habit) => ({ itemType: 'habit' as const, itemId: habit.habitId, sectionId: habit.sectionId, habit })),
     ...openTasks.map((task) => ({ itemType: 'task' as const, itemId: task.taskId, task })),
-    ...expectedClassesForTargetDate.map((klass) => ({ itemType: 'class' as const, itemId: klass.classId, klass })),
+    ...expectedClassesForTargetDate.map((klass) => ({
+      itemType: 'class' as const,
+      itemId: klass.classId,
+      startTime: klass.startTime,
+      klass,
+    })),
   ];
   const grouped = useMemo(
     () =>
@@ -595,7 +648,7 @@ export default function Plan() {
             sections={sections}
             busySectionId={busySectionId}
             onAdd={handleAddSection}
-            onRename={handleRenameSection}
+            onSave={handleSaveSection}
             onMoveUp={(sectionId) => handleSwapSections(sectionId, 'up')}
             onMoveDown={(sectionId) => handleSwapSections(sectionId, 'down')}
             onDelete={handleDeleteSection}

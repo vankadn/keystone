@@ -31,7 +31,7 @@ export const SHEET_SCHEMA = {
   reward_log: ['date', 'personId', 'checkpointIdOrWeekId', 'rewardChosen', 'grantedBy', 'status'],
   classes: ['classId', 'personId', 'name', 'daysOfWeek', 'startTime', 'durationMinutes', 'active', 'pointValue'],
   class_log: ['classId', 'personId', 'date', 'status', 'rescheduledTo', 'skippedBy'],
-  day_sections: ['sectionId', 'personId', 'name', 'sortOrder'],
+  day_sections: ['sectionId', 'personId', 'name', 'sortOrder', 'startTime'],
   day_plan_items: ['personId', 'date', 'itemType', 'itemId', 'sectionId', 'itemSortOrder'],
   points_log: ['personId', 'date', 'itemType', 'itemId', 'pointsEarned'],
   points_rewards: ['rewardId', 'name', 'pointCost'],
@@ -42,8 +42,19 @@ export const SHEET_SCHEMA = {
 
 // Seed data only — nothing in the domain/provider logic assumes exactly
 // 3 sections; the user can add/rename/reorder/delete beyond these later
-// (see addDaySection/updateDaySection/deleteDaySection below).
-const DEFAULT_DAY_SECTIONS = ['Morning', 'Afternoon', 'Evening'];
+// (see addDaySection/updateDaySection/deleteDaySection below). startTime
+// here is the section's own clock-time boundary (see groupItemsBySections
+// in keystone-rules.js), used to default-bucket a Class with no explicit
+// day_plan_items placement into the section whose time range it actually
+// falls in — not just whichever section happens to have the lowest
+// sortOrder, which is what caused a 16:30 class to show up under
+// "Morning" before this existed (sortOrder controls display order only,
+// never had any inherent time meaning).
+const DEFAULT_DAY_SECTIONS = [
+  { name: 'Morning', startTime: '06:00' },
+  { name: 'Afternoon', startTime: '12:00' },
+  { name: 'Evening', startTime: '17:00' },
+];
 
 const SHEETS_API_BASE = 'https://sheets.googleapis.com/v4/spreadsheets';
 
@@ -53,8 +64,16 @@ const SHEETS_API_BASE = 'https://sheets.googleapis.com/v4/spreadsheets';
 const DEFAULT_SHEET_ID = '1kEWgsvtnpy4bVQDgBpdiplpuNGVRWNyty6ckMJvI8kk';
 const SHEET_ID_STORAGE_KEY = 'keystone.sheetId';
 
+// Local calendar date, NOT `new Date().toISOString()` — that's UTC, which
+// silently disagrees with the user's actual "today" for a chunk of every
+// day in any timezone ahead of UTC (e.g. IST, UTC+5:30 — before ~5:30am
+// local, toISOString() is still showing yesterday's UTC date). A class
+// scheduled Tue/Thu showing up on what the user considers Wednesday was
+// exactly this bug. getFullYear/getMonth/getDate are local-timezone
+// accessors (unlike getUTCFullYear/etc.), which is the actual fix.
 function todayISO() {
-  return new Date().toISOString().slice(0, 10);
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 function getApiKey() {
@@ -427,8 +446,8 @@ function generateId(prefix, seed) {
 // backfilled next time Initialize Sheet is (re-)run.
 async function seedDefaultDaySections(sheetId, accessToken, personId) {
   for (let i = 0; i < DEFAULT_DAY_SECTIONS.length; i += 1) {
-    const name = DEFAULT_DAY_SECTIONS[i];
-    const row = { sectionId: generateId('section', name), personId, name, sortOrder: i };
+    const { name, startTime } = DEFAULT_DAY_SECTIONS[i];
+    const row = { sectionId: generateId('section', name), personId, name, sortOrder: i, startTime };
     const values = SHEET_SCHEMA.day_sections.map((col) => row[col] ?? '');
     await appendRow(sheetId, accessToken, 'day_sections', values);
   }
@@ -646,17 +665,17 @@ export async function logClassStatus(classId, personId, dateISO, status, options
 // later calendar/specific-time view; this phase is just the section/
 // ordering data model, not a calendar grid. ----
 
-export async function addDaySection(personId, name, sortOrder) {
+export async function addDaySection(personId, name, sortOrder, startTime) {
   const accessToken = requireAccessToken();
   const sheetId = await getSheetId();
 
-  const row = { sectionId: generateId('section', name), personId, name, sortOrder };
+  const row = { sectionId: generateId('section', name), personId, name, sortOrder, startTime: startTime || '' };
   const values = SHEET_SCHEMA.day_sections.map((col) => row[col] ?? '');
   await appendRow(sheetId, accessToken, 'day_sections', values);
   return row;
 }
 
-export async function updateDaySection(sectionId, { name, sortOrder }) {
+export async function updateDaySection(sectionId, { name, sortOrder, startTime }) {
   const accessToken = requireAccessToken();
   const sheetId = await getSheetId();
 
@@ -666,7 +685,7 @@ export async function updateDaySection(sectionId, { name, sortOrder }) {
   if (!existingRow) throw new Error(`Unknown sectionId: ${sectionId}`);
   const personId = existingRow[header.indexOf('personId')];
 
-  const row = { sectionId, personId, name, sortOrder };
+  const row = { sectionId, personId, name, sortOrder, startTime: startTime || '' };
   await upsertRow(sheetId, accessToken, 'day_sections', 'sectionId', sectionId, row);
   return row;
 }
@@ -1159,5 +1178,31 @@ export async function initializeSheet(sheetId, accessToken) {
     seededDaySectionsFor.push(personId);
   }
 
-  return { created, alreadyExisted, deleted, seededDaySectionsFor };
+  // One-time backfill: existing day_sections rows that predate
+  // `startTime` (added after a class scheduled at 16:30 defaulted into
+  // "Morning" on Today/Plan — sortOrder only ever controlled display
+  // order, it never had any inherent time meaning; see
+  // groupItemsBySections in keystone-rules.js for the actual fix).
+  // Matches by name ONLY here, safely — these are the exact 3 names
+  // seedDefaultDaySections itself writes, so this recovers our own seed
+  // data, not a general name-based heuristic. The real placement logic
+  // is purely time-based, never name-based. Custom/renamed sections are
+  // left alone; their startTime is set via the section-management UI.
+  const sectionNameIndex = sectionHeader.indexOf('name');
+  const sectionStartTimeIndex = sectionHeader.indexOf('startTime');
+  const defaultStartTimeByName = new Map(DEFAULT_DAY_SECTIONS.map((s) => [s.name, s.startTime]));
+  const existingSectionRows = daySectionValues.slice(1);
+  const backfilledSectionStartTimesFor = [];
+  for (let i = 0; i < existingSectionRows.length; i += 1) {
+    const row = existingSectionRows[i];
+    const hasStartTime = (row[sectionStartTimeIndex] || '').trim().length > 0;
+    const defaultStartTime = defaultStartTimeByName.get(row[sectionNameIndex]);
+    if (hasStartTime || !defaultStartTime) continue;
+    const sheetRowNumber = i + 2; // +1 header, +1 1-indexing
+    const updatedValues = sectionHeader.map((col, colIdx) => (col === 'startTime' ? defaultStartTime : row[colIdx] ?? ''));
+    await updateRow(sheetId, accessToken, 'day_sections', sheetRowNumber, updatedValues);
+    backfilledSectionStartTimesFor.push(row[sectionHeader.indexOf('sectionId')]);
+  }
+
+  return { created, alreadyExisted, deleted, seededDaySectionsFor, backfilledSectionStartTimesFor };
 }

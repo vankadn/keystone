@@ -24,8 +24,13 @@ import { Nav } from '../components/Nav';
 
 const OAUTH_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 
+// Local calendar date, NOT `new Date().toISOString()` — see
+// keystone-provider.js's todayISO() for why (UTC disagrees with the
+// user's actual local day for part of every day in any timezone ahead
+// of UTC).
 function todayISO() {
-  return new Date().toISOString().slice(0, 10);
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 const today = todayISO();

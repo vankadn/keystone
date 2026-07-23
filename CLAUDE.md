@@ -46,6 +46,22 @@ many people share a sheet — every tab has a `personId` column, filtered
 rather than split one-tab-per-person (this is what makes a future
 family/aggregate view cheap: filter one log, don't join N tabs).
 
+**"Today" is always the browser's *local* calendar date** — every
+`todayISO()` (one per page, plus `keystone-provider.js`'s own copy) uses
+`getFullYear()`/`getMonth()`/`getDate()` (local-timezone accessors), never
+`new Date().toISOString()` (which is UTC). This matters concretely, not
+just pedantically: for any user east of UTC (IST, UTC+5:30, is this
+family's actual timezone), `toISOString()` still shows *yesterday's* UTC
+date for the first several hours of every local day — a habit/class
+scheduled for a specific weekday would silently evaluate against the
+wrong day. See Phase 16 in the Roadmap for the specific report (a
+Tue/Thu class showing up on an actual Wednesday) and the full fix.
+Date-string *arithmetic* elsewhere (`windowStartISO`, `isoDaysAgo`,
+`addDaysISO`, etc.) is unaffected by this and stays UTC-midnight-anchored
+internally — that's a safe, standard technique for stable day-granularity
+math on an *already-correct* date string, and only ever unsafe at the one
+point where "now" first gets converted into a date string.
+
 `SHEET_SCHEMA` in `src/shared/keystone-provider.js` is the single source of
 truth for tab/column structure. Sheet structure is always app-initialized
 via `initializeSheet()` (see Provider below), never hand-edited in Google
@@ -70,11 +86,17 @@ on why Classes aren't just Habits with extra columns.
 
 `day_sections`/`day_plan_items` (Phase 11) are config-driven per-person
 day-arrangement, not history — see Phase 11 in the Roadmap for the full
-model. `day_sections` (`sectionId`, `personId`, `name`, `sortOrder`) is
-plain per-person config, same "config over one-off logic" convention as
-everything else; nothing in the domain/provider logic hardcodes the
-default count of 3 (Morning/Afternoon/Evening) — that's seed data only,
-the user can add/rename/reorder/delete beyond it. `day_plan_items`
+model. `day_sections` (`sectionId`, `personId`, `name`, `sortOrder`,
+`startTime`) is plain per-person config, same "config over one-off
+logic" convention as everything else; nothing in the domain/provider
+logic hardcodes the default count of 3 (Morning/Afternoon/Evening) —
+that's seed data only, the user can add/rename/reorder/delete beyond it.
+`startTime` (Phase 15, "HH:MM", optional) is the section's own clock-time
+boundary — see Phase 15 in the Roadmap for why this had to be added: a
+class scheduled at 16:30 was defaulting into "Morning" purely because
+Morning happened to be the lowest-`sortOrder` section, since `sortOrder`
+only ever controlled *display* order and had no time meaning at all.
+`day_plan_items`
 (`personId`, `date`, `itemType`, `itemId`, `sectionId`, `itemSortOrder`)
 is which section a specific habit/task/class instance sits in on a given
 date, and its order within that section — separate from the
@@ -237,7 +259,17 @@ each new person with the 3 default day sections immediately (see Data
 model); `initializeSheet` additionally backfills default sections for any
 existing person who has none yet (idempotent — skips anyone who already
 has at least one `day_sections` row), catching people created before this
-feature existed.
+feature existed. `addDaySection`/`updateDaySection` now also take
+`startTime` (Phase 15). `initializeSheet` separately (and additionally)
+backfills `startTime` on *existing* `day_sections` rows that predate that
+column — matched by **name only** against the exact 3 names
+`seedDefaultDaySections` itself writes ("Morning"/"Afternoon"/"Evening"),
+since that's recovering our own seed data, not a general name-based
+heuristic; a custom/renamed section is left with a blank `startTime`
+until the user sets one via the section-management UI. Both backfills
+are idempotent and independent — a person can be missing sections
+entirely, missing just `startTime` on sections they already have, or
+neither.
 
 `awardPoints(personId, dateISO, itemType, itemId, pointsEarned)` appends
 to `points_log` (append-only) — called internally by `setHabitStatus`/
@@ -614,6 +646,79 @@ correctness note" above was written defensively for, but "written
 defensively for" and "confirmed correct against a real click" are
 different things.
 
+Phase 15 (section time-awareness) is code-complete, `tsc -b`/`npm run
+build` clean. Verified thoroughly with mocked-`fetch` scripts: (1) the
+pure `sectionForTime` logic directly — the exact reported repro (a
+16:30 class landing in Afternoon, not Morning, against Morning/
+Afternoon/Evening sections at 06:00/12:00/17:00), a 07:00 class landing
+in Morning, a 20:00 class landing in Evening, sections with no
+`startTime` at all gracefully falling back to the old lowest-`sortOrder`
+behavior, an explicit manual `day_plan_items` placement still overriding
+the time-based default, and Habits confirmed unaffected (still fixed-
+section, never time-based); (2) the `initializeSheet` backfill against a
+simulated *pre-existing* sheet (4-column `day_sections` rows, no
+`startTime` cell at all) — confirmed the 3 default-named sections get
+backfilled to 06:00/12:00/17:00, a custom "Nap time" section is left
+alone, a second `initializeSheet` run doesn't re-backfill, and
+`getDaySections` reads the backfilled values back correctly. That second
+script caught a real mock gap of its own mid-verification (a missing
+`values:batchGet` handler silently returning empty rows) — worth noting
+only because it's a reminder that these mocked-`fetch` scripts are
+themselves fallible and need to actually assert against expected values,
+not just "ran without throwing," which is exactly why the assertions
+are hand-computed per case rather than eyeballed from a printed log.
+Also caught and fixed a related real bug while implementing this:
+`handleSwapSections` (Plan.tsx's section-reorder ↑/↓) was calling
+`updateDaySection` without passing `startTime` through, which would have
+silently wiped it back to blank on every reorder click. Unverified live,
+same blocker as everything else this session: whether the actual
+Google Sheet — not a mock — round-trips a `startTime` value correctly
+through the real Sheets API, and whether the section-management UI's
+new `type="time"` inputs behave as expected in a real browser.
+
+**Correction, same phase**: the first pass above was incomplete and the
+user still saw the exact original bug (16:30 class under "Morning")
+after it shipped. Root cause: `groupItemsBySections` reads `item.startTime`
+at the *top level* for the class-default-placement case, but Today.tsx/
+Plan.tsx were (still) building each class's plan-item as
+`{ itemType: 'class', itemId, klass }` — `startTime` only existed nested
+inside `klass.startTime`, never copied up to the top level, so
+`sectionForTime` always received `undefined` and silently fell through to
+the pre-fix fallback. This is the *exact same category* of integration
+bug as the Phase 11 habit-`sectionId` one (see that Status entry above) —
+and notably, the mocked-`fetch` verification for this phase never would
+have caught it either, because that test constructed its item objects by
+hand with `startTime` already at the top level, matching what the pure
+function expects rather than what the real pages actually produce. Fixed
+by adding `startTime: klass.startTime` to both pages' class item
+construction (mirroring `sectionId: habit.sectionId` for habits) and
+re-verifying with a script that builds the item list exactly the way
+Today.tsx does — confirmed it reproduces the bug against the old
+construction and passes against the fixed one. The lesson repeated
+itself: verifying a pure function in isolation is necessary but not
+sufficient when the actual defect lives at the caller/pure-function
+boundary — an integration-shaped test (build the item the way the real
+page does, not the way the function's signature suggests) is required
+specifically for every new top-level field `groupItemsBySections` reads
+off an item, and this file's own earlier Phase 11 note said exactly
+that, but it wasn't re-applied here on the first attempt.
+
+Phase 16 (local-vs-UTC "today" bugfix) is code-complete, `tsc -b`/`npm
+run build` clean. Verified by mocking the global `Date` constructor and
+running under `TZ=Asia/Kolkata`, at a real wall-clock instant where UTC
+and IST land on different calendar dates — confirmed the pre-fix
+`todayISO()` genuinely resolves to Tuesday at that instant (reproducing
+the report) and the fixed version resolves to the correct Wednesday.
+This bug specifically could not have been caught by any of this
+session's usual mocked-`fetch`/pure-function scripts, since it's a
+system-clock-to-string conversion issue, not a data-flow one — the
+verification method itself had to change (control the clock, not the
+network) to actually exercise it. Unverified live, same standing
+blocker as everything else this session — and this one in particular
+really does need a real device in a real (or spoofed) non-UTC timezone
+to fully confirm, since the bug only manifests during specific hours of
+the day relative to UTC.
+
 ## Roadmap
 - **Phase 0 — Manual setup.** Repo created, Pages enabled, Sheets API
   enabled on `nyra-bhajans`, template Sheet created. Done.
@@ -941,6 +1046,93 @@ different things.
   (preserving `?personId=` if present) via `useNavigate()` — a client-side,
   same-path navigation, which is precisely the case the reactive
   `useEffect` above was already built to handle correctly.
+- **Phase 15 — Section time-awareness (bugfix).** `day_sections` gained a
+  `startTime` column so an unplaced Class defaults into the section
+  matching its own scheduled time, not just whichever section has the
+  lowest `sortOrder`. Code-complete, unverified live (see Status).
+
+  **The bug**: a class scheduled at 16:30 was showing up under
+  "Morning." Root cause: `sortOrder` (Data model, Phase 11) only ever
+  controlled *display* order — it was never meant to carry any time
+  meaning — but `groupItemsBySections`' fallback for an unplaced item
+  (no `day_plan_items` row yet) was "the lowest-`sortOrder` section,"
+  full stop, with no awareness of the item's own scheduled time. Since
+  Morning is seeded at `sortOrder: 0`, *every* freshly-added, never-
+  manually-dragged class landed there regardless of when it actually
+  happens.
+
+  **The fix**: `day_sections.startTime` ("HH:MM", optional) is each
+  section's own clock-time boundary. `sectionForTime` (new, pure,
+  `keystone-rules.js`) finds the latest section whose `startTime` doesn't
+  exceed a given clock time; `groupItemsBySections` calls it specifically
+  for the `itemType === 'class'` unplaced-item case (Classes are the only
+  item type with a clock time of their own — Habits keep their Phase 11
+  fixed-section rule unchanged, Tasks have no time of their own and keep
+  the plain lowest-`sortOrder` fallback). Bucketing is by **start time
+  only** — an item spanning two sections' boundaries is placed by when it
+  *starts*, per the explicit ask, not by duration or end time (which
+  `sectionForTime` doesn't even receive). A section with no `startTime`
+  configured is simply never chosen as a time-based default — graceful
+  degrade to the old lowest-`sortOrder` behavior, not an error; this
+  matters for any section whose `startTime` hasn't been backfilled/set
+  yet. An explicit `day_plan_items` placement (a manual drag) always
+  takes precedence over this default, exactly as before — this only
+  changes what happens *before* anything's been dragged anywhere.
+
+  **Existing sheets**: default-named sections (Morning/Afternoon/Evening)
+  created before this column existed get `startTime` backfilled
+  automatically next time Initialize Sheet is (re-)run (06:00/12:00/17:00
+  — see Provider above for the name-matching caveat, and why it's safe
+  here specifically). Custom/renamed sections are left with a blank
+  `startTime`, settable via the section-management UI on `/plan`, which
+  also gained a `startTime` input on both the add-section form and each
+  existing section's inline edit row.
+- **Phase 16 — Fix "today" computing UTC instead of local date
+  (bugfix).** Code-complete, unverified live (see Status).
+
+  **The bug**: a class scheduled Tue/Thu showed up on the user's actual
+  Wednesday. Root cause: every page's `todayISO()` (and
+  `keystone-provider.js`'s own copy, and `Plan.tsx`'s `tomorrowISO()`)
+  computed `new Date().toISOString().slice(0, 10)` — `toISOString()` is
+  always UTC. For a user east of UTC (this family is in IST, UTC+5:30),
+  UTC's calendar date lags the local one for roughly the first 5.5 hours
+  of every local day — during that window, the app's notion of "today"
+  was still yesterday, so every weekday-dependent computation (which
+  classes are expected today, `getUnclosedHabits`, close-out, the
+  "Adjust today's plan" link's target date, points/milestone dates, all
+  of it) was silently off by one day. This is a foundational,
+  cross-cutting bug, not a one-off: `todayISO()` is the single source
+  every page/the provider uses for "what day is it," so the fix had to
+  land in all 5 duplicated copies of it, not just wherever the reported
+  symptom happened to surface.
+
+  **The fix**: `todayISO()` everywhere now uses `getFullYear()`/
+  `getMonth()`/`getDate()` — local-timezone accessors — instead of
+  `toISOString()`. `Plan.tsx`'s `tomorrowISO()` is now just
+  `addDaysISO(todayISO(), 1)` (a small simplification made while already
+  touching this function) rather than its own separate, also-buggy
+  UTC-based computation. Everywhere *else* that does date-string
+  arithmetic (`windowStartISO`, `isoDaysAgo`, `addDaysISO`,
+  `datesInRangeMatchingDaysOfWeek`, `evaluateClassAttendance`'s window
+  loop) was deliberately left untouched — those all take an
+  already-correct date *string* as input and do UTC-midnight-anchored
+  math on it, which is a safe, standard technique for stable
+  day-granularity arithmetic; the bug was specifically and only in the
+  one place "now" (a moment in time, timezone-sensitive) first became a
+  date string.
+
+  **Verification note**: confirmed by mocking `Date` itself and setting
+  `TZ=Asia/Kolkata` in the Node process, at a wall-clock instant chosen
+  so UTC and IST disagree on the calendar date (2026-07-21 20:30 UTC =
+  2026-07-22 02:00 IST) — the old implementation demonstrably resolved to
+  Tuesday at that instant (reproducing the report), the new one correctly
+  resolves to Wednesday. This is meaningfully different from the earlier
+  Phase 15 correction's lesson (pure-function-in-isolation vs.
+  integration-shaped testing) — this bug couldn't have been caught by
+  *any* variety of mocked-`fetch`/pure-function test at all, since it's
+  purely about system-clock-to-string conversion; it needed the process's
+  actual timezone/clock manipulated, which is why that's what this
+  verification actually did.
 
 **Out of scope for the entire roadmap**: public/verified OAuth (Testing
 mode + Test Users list only), notifications/reminders, a native/mobile

@@ -34,19 +34,27 @@ import { DayPlanBoard } from '../components/DayPlanBoard';
 
 const OAUTH_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 
+// Local calendar date, NOT `new Date().toISOString()` — see
+// keystone-provider.js's todayISO() for why: toISOString() is UTC, which
+// disagrees with the user's actual local day for part of every day in
+// any timezone ahead of UTC (this is what caused a Tue/Thu class to show
+// up on the user's actual Wednesday).
 function todayISO() {
-  return new Date().toISOString().slice(0, 10);
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 const today = todayISO();
 
 type TodayPlanItemBase =
-  // sectionId here is read directly by groupItemsBySections (habits'
-  // fixed home section, see keystone-rules.js) — it's not just along for
-  // the ride on `habit`, the grouping function looks at the top-level field.
+  // sectionId/startTime here are read directly by groupItemsBySections
+  // (habits' fixed home section, classes' time-based default section —
+  // see keystone-rules.js) — they're not just along for the ride on
+  // `habit`/`klass`, the grouping function looks at these top-level
+  // fields specifically, not the nested object.
   | { itemType: 'habit'; itemId: string; sectionId: string; habit: Habit }
   | { itemType: 'task'; itemId: string; task: Task }
-  | { itemType: 'class'; itemId: string; klass: Class };
+  | { itemType: 'class'; itemId: string; startTime: string; klass: Class };
 
 type TodayPlanItem = TodayPlanItemBase & { itemSortOrder: number };
 
@@ -399,7 +407,7 @@ export default function Today() {
   const planItemsBase: TodayPlanItemBase[] = [
     ...habits.map((habit) => ({ itemType: 'habit' as const, itemId: habit.habitId, sectionId: habit.sectionId, habit })),
     ...tasks.map((task) => ({ itemType: 'task' as const, itemId: task.taskId, task })),
-    ...expectedClasses.map((klass) => ({ itemType: 'class' as const, itemId: klass.classId, klass })),
+    ...expectedClasses.map((klass) => ({ itemType: 'class' as const, itemId: klass.classId, startTime: klass.startTime, klass })),
   ];
   const grouped = useMemo(
     () =>
